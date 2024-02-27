@@ -222,7 +222,7 @@ class A3CWorker(mp.Process):
             log_probs, rewards, values, entropies = [], [], [], []
             #gather data for n_step td
             t = 0
-            for _ in range(self.max_n_steps):
+            while t < self.max_n_steps:
                 action, log_prob, entropy = self.local_policy_model.select_action(state) #select action and get corresponding log prob and dist entropy
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
                 #gather log probs, rewards, and entropies to calculate policy gradient
@@ -335,7 +335,8 @@ if __name__ == '__main__':
     a3c = A3C(policy_model_fn= lambda num_obs, nA: FCDAP(num_obs, nA, hidden_dims=(512, 128)),
           value_model_fn=lambda num_obs: FCV(num_obs, hidden_dims=(512, 128)))
     start_time = time.time()
-    results = a3c.train(make_env_fn, num_workers=6, max_episodes=1000, max_T=float("inf"), max_n_steps=100, lmbda=0.25, policy_lr=1e-4, value_lr=2e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000])
+    #note: for "true" GAE, set max_n_steps to inf; for regular n-step td, set max_n_steps to an int and lmbda to 1
+    results = a3c.train(make_env_fn, num_workers=6, max_episodes=1000, max_T=float("inf"), max_n_steps=float("inf"), lmbda=0.9, policy_lr=4e-4, value_lr=8e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000])
     elapsed = time.time() - start_time
     print(f'Elapsed time: {int(elapsed/60)} min {elapsed % 60} sec')
     print('Saving results...')
