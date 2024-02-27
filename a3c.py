@@ -127,7 +127,7 @@ class SharedAdam(torch.optim.Adam):
 
 class A3CWorker(mp.Process):
     def __init__(self, rank, make_env_fn, policy_model_fn, value_model_fn, shared_policy_model, shared_value_model, shared_policy_optimizer, shared_value_optimizer, 
-                 max_episodes, shared_T, max_T, stats, policy_model_max_grad_norm, value_model_max_grad_norm, max_td_steps=5, gamma=1.0, entropy_weight=1e-4):
+                 max_episodes, shared_T, max_T, stats, policy_model_max_grad_norm, value_model_max_grad_norm, max_td_steps=5, gamma=1.0, entropy_weight=1e-4, save_models=None):
         super(A3CWorker, self).__init__()
         self.rank = rank
         self.env = make_env_fn()
@@ -222,15 +222,25 @@ class A3CWorker(mp.Process):
 
                 ep_return += reward * self.gamma**t
                 if terminated or truncated:
-                    #save best model across all workers
-                    if ep_return > self.stats['episode_returns'].max():
-                        self.stats['best_model'].load_state_dict(self.local_policy_model.state_dict())
-                    
                     self.stats['episode_returns'][self.rank, ep_number] = ep_return #store episode return for stats
+                    #get avg return of last 100 episodes
+                    moving_avg_return = self.stats['episode_returns'][self.rank, max(0, ep_number-100):ep_number+1].mean()
+                    #compare and save best model across all workers
+                    if moving_avg_return > self.stats['best_moving_avg_return'][0]:
+                        self.stats['best_model'].load_state_dict(self.local_policy_model.state_dict())
+                        self.stats['best_moving_avg_return'][0] = moving_avg_return
+
                     #reset environment/return, increment episode counter
                     state = self.env.reset()[0]
                     ep_return = 0
                     ep_number += 1
+
+                    #save models at specific episodes for worker 0 only
+                    saved_models = self.stats['saved_models']
+                    if self.rank == 0 and saved_models.get(ep_number):
+                        saved_models[ep_number].load_state_dict(self.local_policy_model.state_dict())
+
+                    
                     break
                 else:
                     state = next_state
@@ -276,7 +286,7 @@ class A3C():
         self.value_optimizer = self.value_optimizer_fn(self.value_model.parameters(), lr=value_lr)
 
     def train(self, make_env_fn, num_workers=4, max_episodes=500, max_T=50000, max_td_steps=5, gamma=1.0, entropy_weight=None, 
-              policy_lr=None, value_lr=None, policy_model_max_grad_norm=1, value_model_max_grad_norm=float('inf')):
+              policy_lr=None, value_lr=None, policy_model_max_grad_norm=1, value_model_max_grad_norm=float('inf'), save_models=None):
         self.gamma = gamma
         if not entropy_weight:
             entropy_weight = self.entropy_weight
@@ -285,34 +295,38 @@ class A3C():
         self._init_model(env, policy_lr, value_lr)
         self.shared_T = torch.IntTensor([0])
         self.stats = {'episode_returns' : torch.zeros([num_workers, max_episodes], dtype=torch.float),
-                      'best_model' : self.policy_model_fn(len(env.observation_space.sample()), env.action_space.n)}
+                      'best_moving_avg_return' : torch.tensor([0.0]),
+                      'best_model' : self.policy_model_fn(len(env.observation_space.sample()), env.action_space.n),
+                      'saved_models' : {ep : self.policy_model_fn(len(env.observation_space.sample()), env.action_space.n) for ep in save_models}}
         #shared models/stats and counter
         self.policy_model.share_memory()
         self.value_model.share_memory()
         self.shared_T.share_memory_()
         self.stats['episode_returns'].share_memory_()
+        self.stats['best_moving_avg_return'].share_memory_()
         self.stats['best_model'].share_memory()
+        [model.share_memory() for model in self.stats['saved_models'].values()]
 
         self.workers = [A3CWorker(rank, make_env_fn, self.policy_model_fn, self.value_model_fn, self.policy_model, self.value_model, self.policy_optimizer, self.value_optimizer, max_episodes, self.shared_T, max_T, 
-                                  self.stats, policy_model_max_grad_norm, value_model_max_grad_norm, max_td_steps, gamma, entropy_weight) for rank in range(num_workers)]
+                                  self.stats, policy_model_max_grad_norm, value_model_max_grad_norm, max_td_steps, gamma, entropy_weight, save_models) for rank in range(num_workers)]
         [w.start() for w in self.workers]
         for w in self.workers:
             w.join()
             print(f'{w} Joined')
-        return self.stats['episode_returns'], self.stats['best_model']
+        return self.stats
         
 if __name__ == '__main__':
     import time
     make_env_fn = lambda : gym.make('CartPole-v1')
 
-    a3c = A3C(policy_model_fn= lambda num_obs, nA: FCDAP(num_obs, nA, hidden_dims=(128, 128)),
+    a3c = A3C(policy_model_fn= lambda num_obs, nA: FCDAP(num_obs, nA, hidden_dims=(512, 128)),
           value_model_fn=lambda num_obs: FCV(num_obs, hidden_dims=(512, 128)))
     start_time = time.time()
-    results = a3c.train(make_env_fn, num_workers=6, max_episodes=1200, max_T=float("inf"), max_td_steps=50, policy_lr=5e-4, value_lr=8e-4, entropy_weight=1e-3)
+    results = a3c.train(make_env_fn, num_workers=6, max_episodes=1000, max_T=float("inf"), max_td_steps=50, policy_lr=1e-4, value_lr=2e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000])
     elapsed = time.time() - start_time
     print(f'Elapsed time: {int(elapsed/60)} min {elapsed % 60} sec')
     print('Saving results...')
     import pickle
     with open('a3c.results', 'wb') as file:
         pickle.dump(results, file)
-    print(results[0].max())
+    print(f"Best moving avg return: {results['best_moving_avg_return'][0]}")
