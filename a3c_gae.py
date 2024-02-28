@@ -127,7 +127,7 @@ class SharedAdam(torch.optim.Adam):
 
 class A3CWorker(mp.Process):
     def __init__(self, rank, make_env_fn, policy_model_fn, value_model_fn, shared_policy_model, shared_value_model, shared_policy_optimizer, shared_value_optimizer, 
-                 max_episodes, shared_T, max_T, stats, policy_model_max_grad_norm, value_model_max_grad_norm, max_n_steps=5, gamma=1.0, lmbda=1.0, entropy_weight=1e-4, save_models=None):
+                 max_episodes, shared_T, max_T, goal, stats, policy_model_max_grad_norm, value_model_max_grad_norm, max_n_steps=5, gamma=1.0, lmbda=1.0, entropy_weight=1e-4, save_models=None):
         super(A3CWorker, self).__init__()
         self.rank = rank
         self.env = make_env_fn()
@@ -142,6 +142,7 @@ class A3CWorker(mp.Process):
         self.max_n_steps = max_n_steps
         self.lmbda = lmbda
         self.max_episodes = max_episodes
+        self.goal = goal
         self.T = shared_T
         self.max_T = max_T
         self.stats = stats
@@ -218,7 +219,7 @@ class A3CWorker(mp.Process):
         state = self.env.reset()[0]
         ep_return = 0
         ep_number = 0
-        while self.T < self.max_T and ep_number < self.max_episodes:
+        while self.T < self.max_T and ep_number < self.max_episodes and self.stats['best_moving_avg_return'][0] < self.goal[0]:
             log_probs, rewards, values, entropies = [], [], [], []
             #gather data for n_step td
             t = 0
@@ -236,7 +237,7 @@ class A3CWorker(mp.Process):
                 if terminated or truncated:
                     self.stats['episode_returns'][self.rank, ep_number] = ep_return #store episode return for stats
                     #get avg return of last 100 episodes
-                    moving_avg_return = self.stats['episode_returns'][self.rank, max(0, ep_number-100):ep_number+1].mean()
+                    moving_avg_return = self.stats['episode_returns'][self.rank, max(0, ep_number-self.goal[1]):ep_number+1].mean()
                     #compare and save best model across all workers
                     if moving_avg_return > self.stats['best_moving_avg_return'][0]:
                         self.stats['best_model'].load_state_dict(self.local_policy_model.state_dict())
@@ -265,7 +266,10 @@ class A3CWorker(mp.Process):
             rewards.append(R)
             values.append(torch.FloatTensor([[R]]))
             self._optimize_model(rewards, values, log_probs, entropies)
-        
+
+        self.stats['episode_returns'][self.rank, ep_number:] = np.nan
+        if ep_number > self.stats['max_episode'][0]:
+            self.stats['max_episode'][0] = ep_number
         print(f'Worker {self.rank} done...')
         
 class A3C():
@@ -298,7 +302,7 @@ class A3C():
         self.value_model = self.value_model_fn(len(env.observation_space.sample()))
         self.value_optimizer = self.value_optimizer_fn(self.value_model.parameters(), lr=value_lr)
 
-    def train(self, make_env_fn, num_workers=4, max_episodes=500, max_T=50000, max_n_steps=5, gamma=1.0, lmbda=1.0, entropy_weight=None, 
+    def train(self, make_env_fn, num_workers=4, max_episodes=500, max_T=50000, goal=(float('inf'), 100), max_n_steps=5, gamma=1.0, lmbda=1.0, entropy_weight=None, 
               policy_lr=None, value_lr=None, policy_model_max_grad_norm=1, value_model_max_grad_norm=float('inf'), save_models=None):
         self.gamma = gamma
         if not entropy_weight:
@@ -309,6 +313,7 @@ class A3C():
         self.shared_T = torch.IntTensor([0])
         self.stats = {'episode_returns' : torch.zeros([num_workers, max_episodes], dtype=torch.float),
                       'best_moving_avg_return' : torch.tensor([0.0]),
+                      'max_episode' : torch.tensor([0]),
                       'best_model' : self.policy_model_fn(len(env.observation_space.sample()), env.action_space.n),
                       'saved_models' : {ep : self.policy_model_fn(len(env.observation_space.sample()), env.action_space.n) for ep in save_models}}
         #shared models/stats and counter
@@ -317,15 +322,17 @@ class A3C():
         self.shared_T.share_memory_()
         self.stats['episode_returns'].share_memory_()
         self.stats['best_moving_avg_return'].share_memory_()
+        self.stats['max_episode'].share_memory_()
         self.stats['best_model'].share_memory()
         [model.share_memory() for model in self.stats['saved_models'].values()]
 
         self.workers = [A3CWorker(rank, make_env_fn, self.policy_model_fn, self.value_model_fn, self.policy_model, self.value_model, self.policy_optimizer, self.value_optimizer, max_episodes, self.shared_T, max_T, 
-                                  self.stats, policy_model_max_grad_norm, value_model_max_grad_norm, max_n_steps, gamma, lmbda, entropy_weight, save_models) for rank in range(num_workers)]
+                                  goal, self.stats, policy_model_max_grad_norm, value_model_max_grad_norm, max_n_steps, gamma, lmbda, entropy_weight, save_models) for rank in range(num_workers)]
         [w.start() for w in self.workers]
         for w in self.workers:
             w.join()
             print(f'{w} Joined')
+        self.stats['episode_returns'] = self.stats['episode_returns'][:, :self.stats['max_episode']+1]
         return self.stats
         
 if __name__ == '__main__':
@@ -336,7 +343,7 @@ if __name__ == '__main__':
           value_model_fn=lambda num_obs: FCV(num_obs, hidden_dims=(512, 128)))
     start_time = time.time()
     #note: for "true" GAE, set max_n_steps to inf; for regular n-step td, set max_n_steps to an int and lmbda to 1
-    results = a3c.train(make_env_fn, num_workers=6, max_episodes=1000, max_T=float("inf"), max_n_steps=float("inf"), lmbda=0.9, policy_lr=4e-4, value_lr=8e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000])
+    results = a3c.train(make_env_fn, num_workers=6, max_episodes=50000, max_T=float("inf"), goal=(450, 10), max_n_steps=float("inf"), lmbda=0.9, policy_lr=2e-4, value_lr=4e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000])
     elapsed = time.time() - start_time
     print(f'Elapsed time: {int(elapsed/60)} min {elapsed % 60} sec')
     print('Saving results...')
