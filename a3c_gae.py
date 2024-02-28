@@ -343,7 +343,7 @@ if __name__ == '__main__':
           value_model_fn=lambda num_obs: FCV(num_obs, hidden_dims=(512, 128)))
     start_time = time.time()
     #note: for "true" GAE, set max_n_steps to inf; for regular n-step td, set max_n_steps to an int and lmbda to 1
-    results = a3c.train(make_env_fn, num_workers=6, max_episodes=50000, max_T=float("inf"), goal=(450, 10), max_n_steps=float("inf"), lmbda=0.9, policy_lr=2e-4, value_lr=4e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000])
+    results = a3c.train(make_env_fn, num_workers=6, max_episodes=50000, max_T=float("inf"), goal=(500, 50), max_n_steps=float("inf"), lmbda=0.97, policy_lr=1e-4, value_lr=5e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000])
     elapsed = time.time() - start_time
     print(f'Elapsed time: {int(elapsed/60)} min {elapsed % 60} sec')
     print('Saving results...')
