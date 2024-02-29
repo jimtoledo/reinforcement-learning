@@ -1,5 +1,5 @@
 import gymnasium as gym
-from gymnasium.envs import box2d
+from gymnasium.wrappers.time_limit import TimeLimit
 import numpy as np
 from itertools import count
 import matplotlib.pyplot as plt
@@ -333,20 +333,20 @@ class A3C():
 if __name__ == '__main__':
     import time
     print('starting')
-    make_env_fn = lambda : gym.make('CartPole-v1')
-    #make_env_fn = lambda : gym.make('LunarLander-v2')
+    #make_env_fn = lambda : gym.make('CartPole-v1')
+    make_env_fn = lambda : TimeLimit(gym.make('LunarLander-v2'), max_episode_steps=5000)
 
     a3c = A3C(policy_model_fn= lambda num_obs, nA: FCDAP(num_obs, nA, hidden_dims=(512, 128)),
           value_model_fn=lambda num_obs: FCV(num_obs, hidden_dims=(512, 128)))
     start_time = time.time()
-    results = a3c.train(make_env_fn, num_workers=6, max_episodes=50000, max_T=float("inf"), goal=(500, 50), max_td_steps=50, policy_lr=1e-4, value_lr=2e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000,5000])
-    #results = a3c.train(make_env_fn, num_workers=6, max_episodes=50000, max_T=float("inf"), goal=(200, 50), max_td_steps=50, policy_lr=1e-4, value_lr=2e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000,5000])
+    #results = a3c.train(make_env_fn, num_workers=6, max_episodes=50000, max_T=float("inf"), goal=(500, 50), max_td_steps=50, policy_lr=1e-4, value_lr=2e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000,5000])
+    results = a3c.train(make_env_fn, num_workers=6, max_episodes=50000, max_T=float("inf"), goal=(200, 50), max_td_steps=100, policy_lr=1e-4, value_lr=2e-4, entropy_weight=1e-3, save_models=[1,100,250,500,750,1000,5000])
 
     elapsed = time.time() - start_time
     print(f'Elapsed time: {int(elapsed/60)} min {elapsed % 60} sec')
     print('Saving results...')
     import pickle
-    with open('a3c.results', 'wb') as file:
-    #with open('a3c_lunarlander.results', 'wb') as file:
+    #with open('a3c.results', 'wb') as file:
+    with open('a3c_lunarlander.results', 'wb') as file:
         pickle.dump(results, file)
     print(f"Best moving avg return: {results['best_moving_avg_return'][0]}")
