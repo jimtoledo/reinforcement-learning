@@ -1,13 +1,8 @@
-import gymnasium as gym
 import numpy as np
 from itertools import count
-import matplotlib.pyplot as plt
-import random
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-import torch.multiprocessing as mp
 from tqdm import tqdm
 
 #DQN with double Q-learning, dueling network and prioritized experience replay improvements
@@ -54,7 +49,7 @@ class PrioritizedReplayBuffer():
         self.memory[self.next_index, 
                     self.td_error_index] = priority #store sample priority
         self.memory[self.next_index, 
-                    self.sample_index] = np.array(sample) #store sample experience
+                    self.sample_index] = np.array(sample, dtype=object) #store sample experience
         
         self.n_entries = min(self.n_entries + 1, self.max_samples)
         self.next_index += 1
@@ -214,14 +209,16 @@ class DDQN():
                 value_optimizer_lr = 1e-4, #optimizer learning rate
                 loss_fn = nn.MSELoss(), #input, target -> loss
                 exploration_strategy = EGreedyExpStrategy(), #module with select_action function (model, state) -> action
-                memory_size = 10000 #replay memory capacity
+                replay_buffer = PrioritizedReplayBuffer(10000),
+                max_gradient_norm = None
                 ):
         self.value_model_fn = value_model_fn
         self.value_optimizer_fn = value_optimizer_fn
         self.value_optimizer_lr = value_optimizer_lr
         self.loss_fn = loss_fn
         self.exploration_strategy = exploration_strategy
-        self.memory = PrioritizedReplayBuffer(memory_size)
+        self.memory = replay_buffer
+        self.max_gradient_norm = max_gradient_norm
 
     def _init_model(self, env):
         #initialize online and target models
@@ -232,22 +229,30 @@ class DDQN():
         self.optimizer = self.value_optimizer_fn(self.online_model.parameters(), lr=self.value_optimizer_lr)
     
     def _optimize_model(self):
-        experiences = self.memory.sample(self.batch_size)
-        experiences = self.online_model.load(experiences)
+        idxs, weights, experiences = self.memory.sample(self.batch_size)
+        weights = self.online_model.numpy_float_to_device(weights)
+        experiences = self.online_model.load(experiences) #numpy to tensor; move to device
         states, actions, rewards, next_states, is_terminals = experiences
     
-        max_a_q_sp = self.target_model(next_states).detach().max(1)[0].unsqueeze(1) #values for next states
+        argmax_a_q_sp = self.online_model(next_states).max(1)[1] #select best action of next state according to online model
+        max_a_q_sp = self.target_model(next_states).detach()[np.arange(self.batch_size), argmax_a_q_sp].unsqueeze(1) #get values of next states using target network
         target_q_sa = rewards + (self.gamma * max_a_q_sp * (1 - is_terminals)) #calculate q target
 
         q_sa = self.online_model(states).gather(1, actions) #get predicted q from model for each state, action pair
 
-        #loss(weights*q_sa, weights*target_q_sa)
-        loss = self.loss_fn(q_sa, target_q_sa) #calculate loss between prediction and target
+        #weigh sample losses by importance sampling for bias correction
+        loss = self.loss_fn(weights*q_sa, weights*target_q_sa) #calculate loss between prediction and target
 
         #optimize step (gradient descent)
         self.optimizer.zero_grad()
         loss.backward()
+        if self.max_gradient_norm:
+            torch.nn.utils.clip_grad_norm_(self.online_model.parameters(), self.max_gradient_norm)
         self.optimizer.step()
+
+        #update TD errors
+        td_errors = (q_sa - target_q_sa).detach().cpu().numpy()
+        self.memory.update(idxs, td_errors)
     
     def train(self, env, gamma=1.0, num_episodes=100, batch_size=64, n_warmup_batches = 5, tau=0.005, target_update_steps=1, save_models=None):
         if save_models: #list of episodes to save models
@@ -300,3 +305,14 @@ class DDQN():
         
         return episode_returns, best_model, saved_models
 
+if __name__ == '__main__':
+    import gymnasium as gym
+    dqn = DDQN(value_model_fn = lambda num_obs, nA: FCDuelingQ(num_obs, nA, hidden_dims=(512,), device=torch.device("cuda")),
+            value_optimizer_lr = 0.0001,
+            exploration_strategy=EGreedyExpStrategy(min_epsilon=0.01),
+            replay_buffer=PrioritizedReplayBuffer()
+            )
+    env = gym.make('CartPole-v1')
+    episode_returns, best_model, saved_models = dqn.train(env, num_episodes=200, tau=0.01, batch_size=128, save_models=[1, 10, 50, 100, 250, 500])
+    print(episode_returns.max())
+    print(episode_returns[-50:])

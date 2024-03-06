@@ -1,15 +1,8 @@
-import gymnasium as gym
-from gymnasium.wrappers.time_limit import TimeLimit
 import numpy as np
-from itertools import count
-import matplotlib.pyplot as plt
 import random
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 import torch.multiprocessing as mp
-from tqdm import tqdm
 
 #Code implementations heavily influenced by https://github.com/mimoralea/gdrl
 #A3C algorithm described in this paper: https://arxiv.org/pdf/1602.01783.pdf with additional max_episodes parameter for balanced training statistics
@@ -332,6 +325,8 @@ class A3C():
         
 if __name__ == '__main__':
     import time
+    import gymnasium as gym
+    from gymnasium.wrappers.time_limit import TimeLimit
     print('starting')
     #make_env_fn = lambda : gym.make('CartPole-v1')
     make_env_fn = lambda : TimeLimit(gym.make('LunarLander-v2'), max_episode_steps=5000)
@@ -347,6 +342,6 @@ if __name__ == '__main__':
     print('Saving results...')
     import pickle
     #with open('a3c.results', 'wb') as file:
-    with open('a3c_lunarlander.results', 'wb') as file:
+    with open('testfiles/a3c_lunarlander.results', 'wb') as file:
         pickle.dump(results, file)
     print(f"Best moving avg return: {results['best_moving_avg_return'][0]}")

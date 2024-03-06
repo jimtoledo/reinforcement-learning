@@ -1,14 +1,8 @@
-import gymnasium as gym
 import numpy as np
-from itertools import count
-import matplotlib.pyplot as plt
 import random
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
 import torch.multiprocessing as mp
-from tqdm import tqdm
 
 #Code implementations heavily influenced by https://github.com/mimoralea/gdrl
 #A3C algorithm described in this paper: https://arxiv.org/pdf/1602.01783.pdf with additional max_episodes parameter for balanced training statistics
@@ -337,6 +331,8 @@ class A3C():
         
 if __name__ == '__main__':
     import time
+    import gymnasium as gym
+
     make_env_fn = lambda : gym.make('CartPole-v1')
 
     a3c = A3C(policy_model_fn= lambda num_obs, nA: FCDAP(num_obs, nA, hidden_dims=(512, 128)),
@@ -348,6 +344,6 @@ if __name__ == '__main__':
     print(f'Elapsed time: {int(elapsed/60)} min {elapsed % 60} sec')
     print('Saving results...')
     import pickle
-    with open('a3c_gae.results', 'wb') as file:
+    with open('testfiles/a3c_gae.results', 'wb') as file:
         pickle.dump(results, file)
     print(f"Best moving avg return: {results['best_moving_avg_return'][0]}")

@@ -1,14 +1,7 @@
-import gymnasium as gym
 import numpy as np
-from itertools import count
-import matplotlib.pyplot as plt
-import random
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-import torch.multiprocessing as mp
-from tqdm import tqdm
 
 #Code implementations heavily influenced by https://github.com/mimoralea/gdrl
 
@@ -227,6 +220,7 @@ class A2C():
         
 if __name__ == '__main__':
     import time
+    import gymnasium as gym
     envs = gym.vector.make("CartPole-v1", num_envs=8)
 
     a2c = A2C(actor_critic_model_fn = lambda num_obs, nA: FCAC(num_obs, nA, hidden_dims=(512, 128)))
@@ -239,6 +233,6 @@ if __name__ == '__main__':
     print(f'Elapsed time: {int(elapsed/60)} min {elapsed % 60} sec')
     print('Saving results...')
     import pickle
-    with open('a2c.results', 'wb') as file:
+    with open('testfiles/a2c.results', 'wb') as file:
         pickle.dump(results, file)
     print(f"Best moving avg return: {results['best_moving_avg_return']}")
