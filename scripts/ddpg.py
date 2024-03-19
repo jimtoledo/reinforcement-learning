@@ -413,18 +413,33 @@ class DDPG():
 if __name__ == '__main__':
     import gymnasium as gym
     from gymnasium.wrappers.time_limit import TimeLimit
-    ddpg = DDPG(policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(512, 128), device=torch.device("cuda")), 
-               policy_optimizer_lr = 0.0003,
-               value_model_fn = lambda num_obs, nA: FCQV(num_obs, nA, hidden_dims=(512, 128), device=torch.device("cuda")),
-               value_optimizer_lr = 0.0005,
-               replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0)) #no PER: alpha=0.0, beta0=0.0, beta_rate=1.0
+    #Pendulum
+    # ddpg = DDPG(policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(512, 128), device=torch.device("cuda")), 
+    #           policy_optimizer_lr = 0.0005,
+    #           value_model_fn = lambda num_obs, nA: FCQV(num_obs, nA, hidden_dims=(512, 128), device=torch.device("cuda")),
+    #           value_optimizer_lr = 0.0005,
+    #           replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0)) #no PER: alpha=0.0, beta0=0.0, beta_rate=1.0
 
-    #env = TimeLimit(gym.make('LunarLander-v2', continuous=True), max_episode_steps=5000)
-    env = gym.make("Pendulum-v1")
-    episode_returns, best_model, saved_models = ddpg.train(env, gamma=0.99, num_episodes=500, tau=0.007, batch_size=512, save_models=[1, 10, 50, 100, 250, 500])
+    # env = gym.make("Pendulum-v1")
+    # episode_returns, best_model, saved_models = ddpg.train(env, gamma=0.99, num_episodes=500, tau=0.01, batch_size=512, save_models=[1, 10, 50, 100, 250, 500])
+    # results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
+    # import pickle
+    # with open('testfiles/ddpg_pendulum.results', 'wb') as file:
+    #     pickle.dump(results, file)
+
+    #Lunar Lander
+    ddpg = DDPG(policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(512, 128), device=torch.device("cuda")), 
+               policy_optimizer_lr = 0.0001,
+               value_model_fn = lambda num_obs, nA: FCQV(num_obs, nA, hidden_dims=(512, 128), device=torch.device("cuda")),
+               value_optimizer_lr = 0.0003,
+               replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0),
+               exploration_strategy_fn = lambda bounds: NormalNoiseDecayStrategy(bounds, init_noise_ratio=0.99, decay_steps=100000, min_noise_ratio=0.1)) #no PER: alpha=0.0, beta0=0.0, beta_rate=1.0
+    env = TimeLimit(gym.make('LunarLander-v2', continuous=True), max_episode_steps=5000)
+    #env = gym.make('LunarLander-v2', continuous=True)
+    episode_returns, best_model, saved_models = ddpg.train(env, gamma=0.99, num_episodes=500, tau=0.005, batch_size=128, save_models=[1, 10, 50, 100, 250, 500])
     print(episode_returns.max())
     print(episode_returns[-50:])
     results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
     import pickle
-    with open('testfiles/ddpg_pendulum.results', 'wb') as file:
+    with open('testfiles/ddpg_lunarlander_limit.results', 'wb') as file:
         pickle.dump(results, file)
