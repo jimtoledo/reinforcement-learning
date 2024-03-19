@@ -6,7 +6,6 @@ import torch.optim as optim
 from tqdm import tqdm
 
 #DQN with double Q-learning, dueling network and prioritized experience replay improvements
-#TODO: PER
 
 #Prioritized Replay Buffer module code from https://github.com/mimoralea/gdrl, comments added for more clarity
 class PrioritizedReplayBuffer():
@@ -259,7 +258,7 @@ class DDQN():
         #initialize exploration strategy
         self.exploration_strategy = self.exploration_strategy_fn()
 
-    def update_target_network(self, tau=None):
+    def _update_target_network(self, tau=None):
         tau = tau if tau else self.tau
         for target, online in zip(self.target_model.parameters(), self.online_model.parameters()):
             target_weights = tau*online.data + (1-tau)*target.data
@@ -294,7 +293,7 @@ class DDQN():
     def get_action(self, state, greedy=False):
         return self.online_model(state).detach().max(1).indices.view(1, 1).item() if greedy else self.exploration_strategy.select_action(self.online_model, state)
 
-    def train(self, env, gamma=1.0, num_episodes=100, batch_size=None, n_warmup_batches = 5, tau=0.005, target_update_steps=1, save_models=None):
+    def train(self, env, gamma=1.0, num_episodes=100, batch_size=None, n_warmup_batches = 5, tau=0.005, target_update_steps=1, save_models=None, seed=None):
         self.exploration_strategy = self.exploration_strategy_fn()
         self.memory = self.memory_fn()
         if save_models: #list of episodes to save models
@@ -306,9 +305,9 @@ class DDQN():
         best_model = None
 
         i = 0
-        episode_returns = np.zeros(num_episodes)
+        episode_returns = np.full(num_episodes, np.NINF)
         for episode in tqdm(range(num_episodes)):
-            state = env.reset()[0]
+            state = env.reset(seed=seed)[0]
             ep_return = 0
             for t in count():
                 i += 1
@@ -356,7 +355,7 @@ class IQL():
             dqn._marl_init_model(env, agent, gamma, batch_size)
             self.dqns[agent] = dqn
 
-    def train(self, env, gamma=1.0, num_episodes=100, parallel=False, batch_size=None, n_warmup_batches = 5, tau=None, target_update_steps=None, save_models=None):
+    def train(self, env, gamma=1.0, num_episodes=100, parallel=False, batch_size=None, n_warmup_batches = 5, tau=None, target_update_steps=None, save_models=None, seed=None):
         self._init_dqns(env, gamma, batch_size)
 
         episode_returns = {agent: [] for agent in self.dqns}
@@ -368,7 +367,7 @@ class IQL():
         for episode in tqdm(range(num_episodes)):
             #previous iter experience variables (state and action) for each agent tracked in dict
             experience = {agent: {'state' : None, 't': 0, 'return': 0} for agent in self.dqns}
-            env.reset()
+            env.reset(seed=seed)
             for agent in env.agent_iter():
                 iter[agent] += 1
                 dqn = self.dqns[agent]
@@ -384,7 +383,7 @@ class IQL():
                 #update target network with tau
                 dqn_target_update_steps = target_update_steps if target_update_steps else dqn.target_update_steps
                 if iter[agent] % dqn_target_update_steps == 0:
-                    dqn.update_target_network(tau)
+                    dqn._update_target_network(tau)
 
                 exp['return'] += reward * gamma**exp['t'] #keep track of individual agent's returns
                 exp['t'] += 1
@@ -418,18 +417,18 @@ if __name__ == '__main__':
     #episode_returns, best_model, saved_models = dqn.train(env, num_episodes=100, tau=0.01, batch_size=128, save_models=[1, 10, 50, 100, 250, 500])
     #print(episode_returns.max())
     #print(episode_returns[-50:])
-    #from pettingzoo.mpe import simple_spread_v3
-    from pettingzoo.mpe import simple_v3
+    from pettingzoo.mpe import simple_spread_v3
+    #from pettingzoo.mpe import simple_v3
     #env = simple_spread_v3.env()
-    env = simple_v3.env(max_cycles=75, continuous_actions=False)
+    env = simple_spread_v3.env(max_cycles=75, continuous_actions=False)
     
-    iql = IQL(dqn_fn = lambda _ : DDQN(value_model_fn = lambda num_obs, nA: FCDuelingQ(num_obs, nA, hidden_dims=(512,), device=torch.device("cuda")),
+    iql = IQL(dqn_fn = lambda _ : DDQN(value_model_fn = lambda num_obs, nA: FCDuelingQ(num_obs, nA, hidden_dims=(512,128,), device=torch.device("cuda")),
             value_optimizer_lr = 0.0005,
             exploration_strategy_fn = lambda : EGreedyExpStrategy(min_epsilon=0.01),
-            replay_buffer_fn = lambda : PrioritizedReplayBuffer()))
+            replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0))) #no PER: alpha=0.0, beta0=0.0, beta_rate=1.0
     
-    episode_returns, best_model, saved_models = iql.train(env, num_episodes=500, tau=0.01, batch_size=128, n_warmup_batches=5, save_models=[1,250,500,1000,2500,5000])
+    episode_returns, best_model, saved_models = iql.train(env, num_episodes=1000, tau=0.007, batch_size=128, n_warmup_batches=5, save_models=[1,250,500,1000,2500,5000], seed=42)
     results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
     import pickle
-    with open('testfiles/iql_simple.results', 'wb') as file:
+    with open('testfiles/iql_spread_42.results', 'wb') as file:
         pickle.dump(results, file)

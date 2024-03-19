@@ -305,7 +305,7 @@ class A3C():
 
         self._init_model(env, policy_lr, value_lr)
         self.shared_T = torch.IntTensor([0])
-        self.stats = {'episode_returns' : torch.zeros([num_workers, max_episodes], dtype=torch.float),
+        self.stats = {'episode_returns' : torch.full([num_workers, max_episodes], np.NINF, dtype=torch.float),
                       'best_moving_avg_return' : torch.tensor([0.0]),
                       'max_episode' : torch.tensor([0]),
                       'best_model' : self.policy_model_fn(len(env.observation_space.sample()), env.action_space.n),
