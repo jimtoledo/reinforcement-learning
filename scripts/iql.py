@@ -355,7 +355,22 @@ class IQL():
             dqn._marl_init_model(env, agent, gamma, batch_size)
             self.dqns[agent] = dqn
 
-    def train(self, env, gamma=1.0, num_episodes=100, parallel=False, batch_size=None, n_warmup_batches = 5, tau=None, target_update_steps=None, save_models=None, seed=None):
+    def evaluate(self, env, gamma, seed=None):
+        env.reset(seed=seed)
+        ep_return = {agent: 0 for agent in self.dqns}
+        t = {agent: 0 for agent in self.dqns}
+        for agent in env.agent_iter():
+            next_state, reward, terminated, truncated, _ = env.last()
+            ep_return[agent] += reward * gamma**t[agent] #keep track of individual agent's returns
+            t[agent] += 1
+            if terminated or truncated:
+                action = None
+            else:
+                action = self.dqns[agent].get_action(next_state)
+            env.step(action)
+        return ep_return
+
+    def train(self, env, gamma=1.0, num_episodes=100, parallel=False, batch_size=None, n_warmup_batches = 5, tau=None, target_update_steps=None, save_models=None, seed=None, evaluate=True):
         self._init_dqns(env, gamma, batch_size)
 
         episode_returns = {agent: [] for agent in self.dqns}
@@ -388,7 +403,8 @@ class IQL():
                 exp['return'] += reward * gamma**exp['t'] #keep track of individual agent's returns
                 exp['t'] += 1
                 if terminated or truncated:
-                    episode_returns[agent].append(exp['return'])
+                    if not evaluate:
+                        episode_returns[agent].append(exp['return'])
                     exp['action'] = None
                 else:
                     exp['action'] = dqn.get_action(next_state) #get action from model
@@ -396,6 +412,10 @@ class IQL():
 
                 env.step(exp['action'])
             
+            if evaluate:
+                for agent, ep_return in self.evaluate(env, gamma, seed).items():
+                    episode_returns[agent].append(ep_return)
+
             for agent in self.dqns:
                 #save best model
                 if exp['return'] >= np.max(episode_returns[agent]):
@@ -417,18 +437,21 @@ if __name__ == '__main__':
     #episode_returns, best_model, saved_models = dqn.train(env, num_episodes=100, tau=0.01, batch_size=128, save_models=[1, 10, 50, 100, 250, 500])
     #print(episode_returns.max())
     #print(episode_returns[-50:])
-    from pettingzoo.mpe import simple_spread_v3
+    #from pettingzoo.mpe import simple_spread_v3
     #from pettingzoo.mpe import simple_v3
+    from pettingzoo.mpe import simple_speaker_listener_v4
+    #from pettingzoo.mpe import simple_reference_v3
     #env = simple_spread_v3.env()
-    env = simple_spread_v3.env(max_cycles=75, continuous_actions=False)
-    
-    iql = IQL(dqn_fn = lambda _ : DDQN(value_model_fn = lambda num_obs, nA: FCDuelingQ(num_obs, nA, hidden_dims=(512,128,), device=torch.device("cuda")),
+    env = simple_speaker_listener_v4.env(continuous_actions=False)
+    #env = simple_reference_v3.env(continuous_actions=False)
+
+    iql = IQL(dqn_fn = lambda _ : DDQN(value_model_fn = lambda num_obs, nA: FCDuelingQ(num_obs, nA, hidden_dims=(128,128,), device=torch.device("cuda")),
             value_optimizer_lr = 0.0005,
-            exploration_strategy_fn = lambda : EGreedyExpStrategy(min_epsilon=0.01),
+            exploration_strategy_fn = lambda : EGreedyExpStrategy(min_epsilon=0.1),
             replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0))) #no PER: alpha=0.0, beta0=0.0, beta_rate=1.0
     
-    episode_returns, best_model, saved_models = iql.train(env, num_episodes=1000, tau=0.007, batch_size=128, n_warmup_batches=5, save_models=[1,250,500,1000,2500,5000], seed=42)
+    episode_returns, best_model, saved_models = iql.train(env, num_episodes=5000, tau=0.005, batch_size=128, n_warmup_batches=5, save_models=[1,250,500,1000,2500,5000])
     results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
     import pickle
-    with open('testfiles/iql_spread_42.results', 'wb') as file:
+    with open('testfiles/iql_speakerlistener2.results', 'wb') as file:
         pickle.dump(results, file)
