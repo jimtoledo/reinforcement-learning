@@ -339,7 +339,7 @@ class TD3():
             argmax_a_q_sp = self.target_policy_model(next_states) #select best action of next state according to target policy network
             noisy_argmax_a_q_sp = argmax_a_q_sp + a_noise #add noise
             noisy_argmax_a_q_sp = torch.clip(noisy_argmax_a_q_sp, action_min, action_max) #clip noisy action to fit action range
-            max_a_q_sp_1, max_a_q_sp_2 = self.target_value_model(next_states, argmax_a_q_sp) #get values of next states using target value network
+            max_a_q_sp_1, max_a_q_sp_2 = self.target_value_model(next_states, noisy_argmax_a_q_sp) #get values of next states using target value network
             target_q_sa = rewards + (self.gamma * torch.min(max_a_q_sp_1, max_a_q_sp_2) * (1 - is_terminals)) #calculate q target using minimum of the two value estimates
 
         q_sa_1, q_sa_2 = self.online_value_model(states, actions) #get predicted q from model for each state, action pair
