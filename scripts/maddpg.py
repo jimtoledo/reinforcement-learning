@@ -61,19 +61,19 @@ class FCDP(nn.Module):
         return self._rescale_fn(x)
     
     def select_action(self, state):
-        return self.forward(state).cpu().detach().numpy().squeeze(axis=0)
+        return self.forward(state).cpu().detach().numpy().squeeze(axis=0).astype(np.float32)
 
 #Fully-connected twin value network (state observation, action -> value_1, value_2)
-#'Shared' critic network as described in MADDPG paper https://arxiv.org/pdf/1706.02275.pdf
-#TODO: implement shared critic architecture
-class Shared_FCTQV(nn.Module):
+#Exact same class as in DDPG/TD3
+class FCTQV(nn.Module):
+    #For MADDPG, state_dim and action_dim should be sum of dims of all agents
     def __init__(self, 
                  state_dim,
                  action_dim,
                  hidden_dims=(32,32), #define hidden layers as tuple where each element is an int representing # of neurons at a layer
                  activation_fc=nn.ReLU,
                  device = torch.device("cpu")):
-        super(Shared_FCTQV, self).__init__()
+        super(FCTQV, self).__init__()
 
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -250,8 +250,8 @@ class NormalNoiseDecayProcess():
         self.noise_ratio = self._noise_ratio_update()
         return noise
 
-#DDPG with PER
-class TD3():
+#Individual agent for MADDPG RL algorithm
+class MADDPGAgent():
     def __init__(self, 
                 policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds), #state vars, action bounds -> model
                 policy_optimizer_fn = lambda params, lr : optim.Adam(params, lr), #model params, lr -> optimizer
@@ -264,10 +264,10 @@ class TD3():
                 value_loss_fn = nn.MSELoss(), #input, target -> loss
                 exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(), #module with get_noise function size -> noise array (noise in [-1,1])
                 target_policy_noise_process_fn = lambda: NormalNoiseProcess(),
-                target_policy_noise_clip_ratio = 0.3, 
-                replay_buffer_fn = lambda : PrioritizedReplayBuffer(10000),
+                target_policy_noise_clip_ratio = 0.3,
                 tau=0.005, 
-                target_update_steps=1
+                target_update_steps=1,
+                action_bounds_epsilon=0
                 ):
         self.policy_model_fn = policy_model_fn
         self.policy_optimizer_fn = policy_optimizer_fn
@@ -281,33 +281,57 @@ class TD3():
         self.exploration_noise_process_fn = exploration_noise_process_fn
         self.target_policy_noise_process_fn = target_policy_noise_process_fn
         self.target_policy_noise_clip_ratio = target_policy_noise_clip_ratio
-        self.memory_fn = replay_buffer_fn
         self.tau = tau
         self.target_update_steps = target_update_steps
+        self.action_bounds_epsilon = action_bounds_epsilon
 
-    def _init_model(self, env):
-        nS, nA = env.observation_space.shape[0], env.action_space.shape[0]
+    #Assuming PettingZoo multi-agent environment API
+    def _init_model(self, env, agent, memory, gamma=1.0, batch_size=None):
+        self.agent = agent
+        self.gamma = gamma
+        #individual agent observation/action space for policy network
+        self._nS, self._nA = env.observation_space(agent).shape[0], env.action_space(agent).shape[0]
+        self.action_bounds = env.action_space(agent).low + self.action_bounds_epsilon, env.action_space(agent).high - self.action_bounds_epsilon
+
+        shared_nS, shared_nA = 0, 0 #shared observation/action space dims for critic network
+        for n, agent in enumerate(env.possible_agents): #use env.possible_agents to keep order consistent
+            if(agent == self.agent):
+                #get starting indices of agent's state/action/reward in shared experience tuple
+                self._agent_index, self._state_index, self._action_index = n, shared_nS, shared_nA
+            shared_nS += env.observation_space(agent).shape[0]
+            shared_nA += env.action_space(agent).shape[0]
+
 
         #initialize online and target models
-        self.online_policy_model = self.policy_model_fn(nS, self.action_bounds)
-        self.target_policy_model = self.policy_model_fn(nS, self.action_bounds)
+        self.online_policy_model = self.policy_model_fn(self._nS, self.action_bounds)
+        self.target_policy_model = self.policy_model_fn(self._nS, self.action_bounds)
         self.target_policy_model.load_state_dict(self.online_policy_model.state_dict()) #copy online model parameters to target model
 
-        self.online_value_model = self.value_model_fn(nS, nA)
-        self.target_value_model = self.value_model_fn(nS, nA)
+        self.online_value_model = self.value_model_fn(shared_nS, shared_nA)
+        self.target_value_model = self.value_model_fn(shared_nS, shared_nA)
         self.target_value_model.load_state_dict(self.online_value_model.state_dict()) #copy online model parameters to target model
 
         #initialize optimizer
         self.policy_optimizer = self.policy_optimizer_fn(self.online_policy_model.parameters(), lr=self.policy_optimizer_lr)
         self.value_optimizer = self.value_optimizer_fn(self.online_value_model.parameters(), lr=self.value_optimizer_lr)
 
-    def _copy_policy_model(self, env):
-        copy = self.policy_model_fn(env.observation_space.shape[0], (env.action_space.low, env.action_space.high))
+        #initialize replay memory
+        self.memory = memory
+        self.batch_size = batch_size if batch_size else self.memory.batch_size
+
+        #initialize noise processes
+        self.exploration_noise = self.exploration_noise_process_fn()
+        self.target_policy_noise = self.target_policy_noise_process_fn()
+
+    def _copy_policy_model(self):
+        copy = self.policy_model_fn(self._nS, self.action_bounds)
         copy.load_state_dict(self.online_policy_model.state_dict())
         return copy
     
     def _copy_value_model(self, env):
-        copy = self.value_model_fn(env.observation_space.shape[0], env.action_space.shape[0])
+        nS = np.sum([env.observation_space(agent).shape[0] for agent in env.possible_agents])
+        nA = np.sum([env.action_space(agent).shape[0] for agent in env.possible_agents])
+        copy = self.value_model_fn(nS, nA)
         copy.load_state_dict(self.online_value_model.state_dict())
         return copy
 
@@ -322,33 +346,48 @@ class TD3():
             target_weights = tau*online.data + (1-tau)*target.data
             target.data.copy_(target_weights)
 
-    def _optimize_model(self, batch_size=None, update_policy=True):
-        idxs, weights, experiences = self.memory.sample(batch_size)
-        weights = self.online_value_model.numpy_float_to_device(weights)
-        experiences = self.online_value_model.load(experiences) #numpy to tensor; move to device
-        states, actions, rewards, next_states, is_terminals = experiences
-    
-        #get target action noise
+    def _get_noisy_target_action(self, shared_states):
+        states = shared_states[:, self._state_index:self._state_index+self._nS] #get individual agent's observations
         with torch.no_grad():
             action_max, action_min = self.target_policy_model.action_max, self.target_policy_model.action_min
             a_range = action_max - action_min
             #get noise in [-1,1] and scale to action range
-            a_noise = torch.tensor(self.target_policy_noise.get_noise(actions.shape), device=self.target_policy_model.device, dtype=torch.float32) * a_range
+            a_noise = torch.tensor(self.target_policy_noise.get_noise((states.shape[0], self._nA)), device=self.target_policy_model.device, dtype=torch.float32) * a_range
             n_min = action_min * self.target_policy_noise_clip_ratio
             n_max = action_max * self.target_policy_noise_clip_ratio
             a_noise = torch.clip(a_noise, n_min, n_max) #clip noise according to clip ratio
 
-            argmax_a_q_sp = self.target_policy_model(next_states) #select best action of next state according to target policy network
-            noisy_argmax_a_q_sp = argmax_a_q_sp + a_noise #add noise
-            noisy_argmax_a_q_sp = torch.clip(noisy_argmax_a_q_sp, action_min, action_max) #clip noisy action to fit action range
-            max_a_q_sp_1, max_a_q_sp_2 = self.target_value_model(next_states, argmax_a_q_sp) #get values of next states using target value network
-            target_q_sa = rewards + (self.gamma * torch.min(max_a_q_sp_1, max_a_q_sp_2) * (1 - is_terminals)) #calculate q target using minimum of the two value estimates
+            next_action = self.target_policy_model(states) #select best action of next state according to target policy network
+        return torch.clip(next_action + a_noise, action_min, action_max) #clip noisy action to fit action range
 
-        q_sa_1, q_sa_2 = self.online_value_model(states, actions) #get predicted q from model for each state, action pair
+    def _optimize_model(self, env, agents, batch_size=None, update_policy=True):
+        #NOTE: agents = dictionary of agent str -> MADDPGAgent object
+        idxs, weights, experiences = self.memory.sample(batch_size)
+        weights = self.online_value_model.numpy_float_to_device(weights)
+
+        #experiences = self.online_value_model.load(experiences) #numpy to tensor; move to device
+        #shared states/actions used in critic network
+        shared_states, shared_actions, rewards, shared_next_states, is_terminals = self.online_value_model.load(experiences) #numpy to tensor; move to device
+        
+        #get experiences for this agent
+        states = shared_states[:, self._state_index:self._state_index+self._nS]
+        #actions = shared_actions[:, self._action_index:self._action_index+self._nA]
+        #next_states = shared_next_states[:, self._state_index: self._state_index+self._nS]
+
+        i = slice(self._agent_index, self._agent_index+1)
+        rewards, is_terminals = rewards[:, i], is_terminals[:, i]
+        with torch.no_grad():
+            #get actions in next states FOR ALL agents for target value calculation
+            shared_next_actions = torch.cat([agents[agent]._get_noisy_target_action(shared_next_states).T for agent in env.possible_agents]).T #shape: (batch_size, sum(action_dims))
+            next_state_values = torch.min(*self.target_value_model(shared_next_states, shared_next_actions)) #use minimum of twin network outputs
+            target_values = rewards + (self.gamma * next_state_values * (1 - is_terminals))
+
+        q_sa_1, q_sa_2 = self.online_value_model(shared_states, shared_actions) #get predicted q from model for each state, action pair
 
         #get value loss for each critic - weigh sample losses by importance sampling for bias correction
         #calculate loss between prediction and target
-        value_loss = self.value_loss_fn(torch.cat([weights*q_sa_1, weights*q_sa_2]), torch.cat([weights*target_q_sa, weights*target_q_sa]))
+        #NOTE: this line could be a potential source of error in training?
+        value_loss = self.value_loss_fn(torch.cat([weights*q_sa_1, weights*q_sa_2]), torch.cat([weights*target_values, weights*target_values]))
 
         #optimize critic networks
         self.value_optimizer.zero_grad()
@@ -358,13 +397,14 @@ class TD3():
         self.value_optimizer.step()
 
         #update TD errors
-        td_errors = (q_sa_1 - target_q_sa).detach().cpu().numpy()
+        td_errors = (q_sa_1 - target_values).detach().cpu().numpy()
         self.memory.update(idxs, td_errors)
 
         #get policy gradient/loss
         if update_policy:
-            argmax_a_q_s = self.online_policy_model(states) #select best action of state using online policy network
-            max_a_q_s = self.online_value_model.Q1(states, argmax_a_q_s) #get value using online value network
+            actions = self.online_policy_model(states) #select best action of state using online policy network
+            shared_actions[:, self._action_index:self._action_index+self._nA] = actions
+            max_a_q_s = self.online_value_model.Q1(shared_states, shared_actions) #get value using online value network
             policy_loss = -max_a_q_s.mean() #policy gradient calculated using "backward" on the *negative* mean of the values
 
             #optimize actor network
@@ -378,102 +418,150 @@ class TD3():
         with torch.no_grad():
             action = self.online_policy_model.select_action(state)
         if explore:
-            noise = self.exploration_noise.get_noise(len(self.action_bounds[0]))
+            noise = self.exploration_noise.get_noise(len(self.action_bounds[0])).astype(np.float32)
             action = np.clip(action + noise, *self.action_bounds)
         
         return action
 
+class MADDPG():
+    def __init__(self,
+                 agent_fn = lambda agent: MADDPGAgent(),
+                 replay_buffer_fn = lambda : PrioritizedReplayBuffer(10000),
+                 ):
+        self.agent_fn = agent_fn
+        self.memory_fn = replay_buffer_fn
+        self.agents = {}
+    
+    def _init_agents(self, env, gamma, batch_size=None):
+        for agent in env.possible_agents:
+            ddpg = self.agent_fn(agent)
+            ddpg._init_model(env, agent, self.memory, gamma, batch_size)
+            self.agents[agent] = ddpg
+    
+    def _store_experience(self, state, action, reward, next_state, terminated):
+        #use env.possible_agents to keep array order consistent
+        state = np.concatenate([state[agent] for agent in env.possible_agents])
+        action = np.concatenate([action[agent] for agent in env.possible_agents])
+        next_state = np.concatenate([next_state[agent] for agent in env.possible_agents])
+        reward = np.array([reward[agent] for agent in env.possible_agents])
+        terminated = np.array([terminated[agent] for agent in env.possible_agents] + [False]) #add extra value to terminals list to block potential np 2D-array conversion
+        self.memory.store((state, action, reward, next_state, terminated)) #store experience in replay memory
+
     def evaluate(self, env, gamma, seed=None):
         state = env.reset(seed=seed)[0]
-        ep_return = 0
+        ep_return = {agent: 0 for agent in self.agents}
         for t in count():
-            action = self.get_action(state, explore=False)
-            state, reward, terminated, truncated, _ = env.step(action)
-            ep_return += reward * gamma**t
-            if terminated or truncated:
-                return ep_return
-
+            if not env.agents: break
+            action = {agent: self.agents[agent].get_action(state[agent], explore=False) for agent in env.agents}
+            state, reward, _, _, _ = env.step(action)
+            for agent in env.agents: ep_return[agent] += reward[agent] * gamma**t
+        return ep_return
 
     def train(self, env, gamma=1.0, num_episodes=100, batch_size=None, n_warmup_batches = 5, tau=0.005, target_update_steps=2, policy_update_steps=2, save_models=None, seed=None, evaluate=True):
+        #NOTE: assuming env is instance of parallel_env, all agents available throughout entire episode length
         self.memory = self.memory_fn()
-        self.exploration_noise = self.exploration_noise_process_fn()
-        self.target_policy_noise = self.target_policy_noise_process_fn()
-        if save_models: #list of episodes to save models
-                save_models.sort()
-        self.gamma = gamma
-        self.action_bounds = env.action_space.low, env.action_space.high
-        self._init_model(env)
+        self._init_agents(env, gamma, batch_size)
+        batch_size = batch_size if batch_size else self.memory.batch_size
 
+        episode_returns = {agent: [] for agent in self.agents}
         saved_models = {}
-        best_model = None
+        best_model = {agent: None for agent in self.agents}
 
         i = 0
-        episode_returns = np.full(num_episodes, np.NINF)
         for episode in tqdm(range(num_episodes)):
             state = env.reset(seed=seed)[0]
-            ep_return = 0
+            ep_return = {agent: 0 for agent in self.agents}
             for t in count():
-                i += 1
-                action = self.get_action(state, explore=True) #use online model to select action
+                if not env.agents: break
+                action = {agent: self.agents[agent].get_action(state[agent], explore=True) for agent in env.agents}
                 next_state, reward, terminated, truncated, _ = env.step(action)
-                self.memory.store((state, action, reward, next_state, terminated)) #store experience in replay memory
+                self._store_experience(state, action, reward, next_state, terminated)
                 
                 state = next_state
 
-                if len(self.memory) >= batch_size*n_warmup_batches: #optimize policy model
-                    self._optimize_model(batch_size, i % policy_update_steps == 0) #only update policy every d update
+                if len(self.memory) >= batch_size*n_warmup_batches: #optimize models
+                    for agent in env.agents:
+                        self.agents[agent]._optimize_model(env, self.agents, batch_size, i % policy_update_steps == 0) #only update policy every d update
 
-                #update target network with tau
+                #update target networks with tau
                 if i % target_update_steps == 0:
-                    self._update_target_networks(tau)
+                    for agent in env.agents: self.agents[agent]._update_target_networks(tau)
 
-                ep_return += reward * gamma**t #add discounted reward to return
-                if terminated or truncated:
-                    #copy and save model
-                    if save_models and len(saved_models) < len(save_models) and episode+1 == save_models[len(saved_models)]:
-                        saved_models[episode+1] = self._copy_policy_model(env)
+                for agent in env.agents: ep_return[agent] += reward[agent] * gamma**t #add discounted reward to return
+            
+            if evaluate: ep_return = self.evaluate(env, gamma, seed)
+            for agent, r in ep_return.items():
+                episode_returns[agent].append(r)
+                if r >= np.max(episode_returns[agent]): #save best model
+                    best_model[agent] = self.agents[agent]._copy_policy_model()
+            
+            #copy and save models
+            if save_models and len(saved_models) < len(save_models) and episode+1 == save_models[len(saved_models)]:
+                saved_models[episode+1] = {agent: self.agents[agent]._copy_policy_model() for agent in self.agents}
 
-                    #save best model
-                    if evaluate:
-                        ep_return = self.evaluate(env, gamma, seed) #evaluate current policy with no noise
-                    if ep_return >= episode_returns.max():
-                        best_model = self._copy_policy_model(env)
-                    episode_returns[episode] = ep_return
-                    break
-
-        
+        env.close()
         return episode_returns, best_model, saved_models
     
-if __name__ == '__main__':
-    import gymnasium as gym
-    from gymnasium.wrappers.time_limit import TimeLimit
-    #Pendulum
-    # td3 = TD3(policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(512, 128), device=torch.device("cuda")), 
-    #           policy_optimizer_lr = 0.0005,
-    #           value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(512, 128), device=torch.device("cuda")),
-    #           value_optimizer_lr = 0.0005,
-    #           replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0)) #no PER: alpha=0.0, beta0=0.0, beta_rate=1.0
 
-    # env = gym.make("Pendulum-v1")
-    # episode_returns, best_model, saved_models = td3.train(env, gamma=0.99, num_episodes=500, tau=0.005, batch_size=512, save_models=[1, 10, 50, 100, 250, 500])
+
+if __name__ == '__main__':
+
+    #speaker_listener
+    # from pettingzoo.mpe import simple_speaker_listener_v4
+    # env = simple_speaker_listener_v4.parallel_env(max_cycles=50, continuous_actions=True)
+    # maddpg = MADDPG(agent_fn = lambda agent: MADDPGAgent(
+    #     policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(256,256), device=torch.device("cuda")),
+    #     policy_optimizer_lr = 0.0001,
+    #     value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(256, 256), device=torch.device("cuda")),
+    #     value_optimizer_lr = 0.0001,
+    #     exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(init_noise_ratio=0.9, decay_steps=5000, min_noise_ratio=0.1),
+    #     target_policy_noise_process_fn = lambda: NormalNoiseProcess(),
+    #     target_policy_noise_clip_ratio = 0.2,
+    # ),
+    # replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0))
+
+    # episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=2000, tau=0.005, batch_size=256, save_models=[1, 50, 100, 500, 1000, 2000])
     # results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
     # import pickle
-    # with open('testfiles/td3_pendulum.results', 'wb') as file:
-    #     pickle.dump(results, file)
+    # with open('testfiles/maddpg_speakerlistener.results', 'wb') as file:
+    #    pickle.dump(results, file)
 
-    #Lunar Lander
-    ddpg = TD3(policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(512, 128), device=torch.device("cuda")), 
-               policy_optimizer_lr = 0.0001,
-               value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(512, 128), device=torch.device("cuda")),
-               value_optimizer_lr = 0.0002,
-               replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0),
-               exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(init_noise_ratio=0.99, decay_steps=25000, min_noise_ratio=0.1)) #no PER: alpha=0.0, beta0=0.0, beta_rate=1.0
-    env = TimeLimit(gym.make('LunarLander-v2', continuous=True), max_episode_steps=1000)
-    #env = gym.make('LunarLander-v2', continuous=True)
-    episode_returns, best_model, saved_models = ddpg.train(env, gamma=0.95, num_episodes=500, tau=0.005, batch_size=128, save_models=[1, 10, 50, 100, 250, 500])
-    print(episode_returns.max())
-    print(episode_returns[-50:])
+    #spread
+    # from pettingzoo.mpe import simple_spread_v3
+    # env = simple_spread_v3.parallel_env(max_cycles=50, continuous_actions=True)
+    # maddpg = MADDPG(agent_fn = lambda agent: MADDPGAgent(
+    #     policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(256,256), device=torch.device("cuda")),
+    #     policy_optimizer_lr = 0.0001,
+    #     value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(256, 256), device=torch.device("cuda")),
+    #     value_optimizer_lr = 0.0001,
+    #     exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(init_noise_ratio=0.9, decay_steps=5000, min_noise_ratio=0.1),
+    #     target_policy_noise_process_fn = lambda: NormalNoiseProcess(),
+    #     target_policy_noise_clip_ratio = 0.2,
+    # ),
+    # replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0))
+
+    # episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=2000, tau=0.005, batch_size=256, save_models=[1, 50, 100, 500, 1000, 2000])
+    # results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
+    # import pickle
+    # with open('testfiles/maddpg_spread.results', 'wb') as file:
+    #    pickle.dump(results, file)
+
+    #reference
+    from pettingzoo.mpe import simple_reference_v3
+    env = simple_reference_v3.parallel_env(max_cycles=50, continuous_actions=True)
+    maddpg = MADDPG(agent_fn = lambda agent: MADDPGAgent(
+        policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(256,256), device=torch.device("cuda")),
+        policy_optimizer_lr = 0.0001,
+        value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(256, 256), device=torch.device("cuda")),
+        value_optimizer_lr = 0.0002,
+        exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(init_noise_ratio=0.9, decay_steps=10000, min_noise_ratio=0.1),
+        target_policy_noise_process_fn = lambda: NormalNoiseProcess(exploration_noise_ratio=0.05),
+        target_policy_noise_clip_ratio = 0.1,
+    ),
+    replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0))
+
+    episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=5000, tau=0.005, batch_size=512, save_models=[1, 50, 100, 500, 1000, 2000, 5000])
     results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
     import pickle
-    with open('testfiles/td3_lunarlander_limit.results', 'wb') as file:
+    with open('testfiles/maddpg_reference.results', 'wb') as file:
        pickle.dump(results, file)
