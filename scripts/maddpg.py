@@ -548,12 +548,12 @@ if __name__ == '__main__':
 
     #reference
     from pettingzoo.mpe import simple_reference_v3
-    env = simple_reference_v3.parallel_env(max_cycles=50, continuous_actions=True)
+    env = simple_reference_v3.parallel_env(continuous_actions=True)
     maddpg = MADDPG(agent_fn = lambda agent: MADDPGAgent(
         policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(256,256), device=torch.device("cuda")),
-        policy_optimizer_lr = 0.0001,
+        policy_optimizer_lr = 0.0002,
         value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(256, 256), device=torch.device("cuda")),
-        value_optimizer_lr = 0.0002,
+        value_optimizer_lr = 0.0004,
         exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(init_noise_ratio=0.9, decay_steps=10000, min_noise_ratio=0.1),
         target_policy_noise_process_fn = lambda: NormalNoiseProcess(exploration_noise_ratio=0.05),
         target_policy_noise_clip_ratio = 0.1,
@@ -563,5 +563,5 @@ if __name__ == '__main__':
     episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=5000, tau=0.005, batch_size=512, save_models=[1, 50, 100, 500, 1000, 2000, 5000])
     results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
     import pickle
-    with open('testfiles/maddpg_reference.results', 'wb') as file:
+    with open('testfiles/maddpg_reference1.results', 'wb') as file:
        pickle.dump(results, file)
