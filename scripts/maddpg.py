@@ -145,7 +145,7 @@ class PrioritizedReplayBuffer():
                  beta0=0.1, 
                  beta_rate=0.99992,
                  epsilon=1e-6):
-        self.max_samples = max_samples
+        self.max_samples = int(max_samples)
         self.memory = np.empty(shape=(self.max_samples, 2), dtype=np.ndarray) #2-d array of sample experiences and td errors
         self.batch_size = batch_size
         self.n_entries = 0 #current size of buffer
@@ -471,6 +471,7 @@ class MADDPG():
         for episode in tqdm(range(num_episodes)):
             state = env.reset(seed=seed)[0]
             ep_return = {agent: 0 for agent in self.agents}
+            i = i % target_update_steps * policy_update_steps
             for t in count():
                 if not env.agents: break
                 action = {agent: self.agents[agent].get_action(state[agent], explore=True) for agent in env.agents}
@@ -479,6 +480,7 @@ class MADDPG():
                 
                 state = next_state
 
+                i += 1
                 if len(self.memory) >= batch_size*n_warmup_batches: #optimize models
                     for agent in env.agents:
                         self.agents[agent]._optimize_model(env, self.agents, batch_size, i % policy_update_steps == 0) #only update policy every d update
@@ -508,22 +510,22 @@ if __name__ == '__main__':
 
     #speaker_listener
     # from pettingzoo.mpe import simple_speaker_listener_v4
-    # env = simple_speaker_listener_v4.parallel_env(max_cycles=50, continuous_actions=True)
+    # env = simple_speaker_listener_v4.parallel_env(continuous_actions=True)
     # maddpg = MADDPG(agent_fn = lambda agent: MADDPGAgent(
-    #     policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(256,256), device=torch.device("cuda")),
-    #     policy_optimizer_lr = 0.0001,
-    #     value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(256, 256), device=torch.device("cuda")),
-    #     value_optimizer_lr = 0.0001,
-    #     exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(init_noise_ratio=0.9, decay_steps=5000, min_noise_ratio=0.1),
+    #     policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(128, 128), device=torch.device("cuda")),
+    #     policy_optimizer_lr = 0.001,
+    #     value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(128, 128), device=torch.device("cuda")),
+    #     value_optimizer_lr = 0.001,
+    #     exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(),
     #     target_policy_noise_process_fn = lambda: NormalNoiseProcess(),
-    #     target_policy_noise_clip_ratio = 0.2,
+    #     target_policy_noise_clip_ratio = 0.1,
     # ),
-    # replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0))
+    # replay_buffer_fn = lambda : PrioritizedReplayBuffer(max_samples=1e6, alpha=0.0, beta0=0.0, beta_rate=1.0))
 
-    # episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=2000, tau=0.005, batch_size=256, save_models=[1, 50, 100, 500, 1000, 2000])
+    # episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=5000, tau=0.01, batch_size=1024, save_models=[1, 50, 100, 500, 1000, 2000, 5000])
     # results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
     # import pickle
-    # with open('testfiles/maddpg_speakerlistener.results', 'wb') as file:
+    # with open('testfiles/maddpg_speakerlistener1.results', 'wb') as file:
     #    pickle.dump(results, file)
 
     #spread
@@ -547,21 +549,41 @@ if __name__ == '__main__':
     #    pickle.dump(results, file)
 
     #reference
-    from pettingzoo.mpe import simple_reference_v3
-    env = simple_reference_v3.parallel_env(continuous_actions=True)
-    maddpg = MADDPG(agent_fn = lambda agent: MADDPGAgent(
-        policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(256,256), device=torch.device("cuda")),
-        policy_optimizer_lr = 0.0002,
-        value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(256, 256), device=torch.device("cuda")),
-        value_optimizer_lr = 0.0004,
-        exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(init_noise_ratio=0.9, decay_steps=50000, min_noise_ratio=0.2),
-        target_policy_noise_process_fn = lambda: NormalNoiseProcess(exploration_noise_ratio=0.1),
-        target_policy_noise_clip_ratio = 0.2,
-    ),
-    replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0))
+    # from pettingzoo.mpe import simple_reference_v3
+    # env = simple_reference_v3.parallel_env(continuous_actions=True)
+    # maddpg = MADDPG(agent_fn = lambda agent: MADDPGAgent(
+    #     policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(256,256), device=torch.device("cuda")),
+    #     policy_optimizer_lr = 0.0002,
+    #     value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(256, 256), device=torch.device("cuda")),
+    #     value_optimizer_lr = 0.0004,
+    #     exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(init_noise_ratio=0.9, decay_steps=50000, min_noise_ratio=0.2),
+    #     target_policy_noise_process_fn = lambda: NormalNoiseProcess(exploration_noise_ratio=0.1),
+    #     target_policy_noise_clip_ratio = 0.2,
+    # ),
+    # replay_buffer_fn = lambda : PrioritizedReplayBuffer(alpha=0.0, beta0=0.0, beta_rate=1.0))
 
-    episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=8000, tau=0.01, batch_size=512, save_models=[1, 50, 100, 500, 1000, 2000, 5000, 8000])
+    # episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=8000, tau=0.01, batch_size=512, save_models=[1, 50, 100, 500, 1000, 2000, 5000, 8000])
+    # results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
+    # import pickle
+    # with open('testfiles/maddpg_reference1.results', 'wb') as file:
+    #    pickle.dump(results, file)
+
+    #adversary
+    from pettingzoo.mpe import simple_adversary_v3
+    env = simple_adversary_v3.parallel_env(continuous_actions=True)
+    maddpg = MADDPG(agent_fn = lambda agent: MADDPGAgent(
+        policy_model_fn = lambda num_obs, bounds: FCDP(num_obs, bounds, hidden_dims=(128, 128), device=torch.device("cuda")),
+        policy_optimizer_lr = 0.001,
+        value_model_fn = lambda num_obs, nA: FCTQV(num_obs, nA, hidden_dims=(128, 128), device=torch.device("cuda")),
+        value_optimizer_lr = 0.001,
+        exploration_noise_process_fn = lambda: NormalNoiseDecayProcess(),
+        target_policy_noise_process_fn = lambda: NormalNoiseProcess(),
+        target_policy_noise_clip_ratio = 0.1,
+    ),
+    replay_buffer_fn = lambda : PrioritizedReplayBuffer(max_samples=1e6, alpha=0.0, beta0=0.0, beta_rate=1.0))
+
+    episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=10000, tau=0.01, batch_size=1024, save_models=[1, 500, 1000, 2000, 5000, 8000, 10000])
     results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
     import pickle
-    with open('testfiles/maddpg_reference1.results', 'wb') as file:
+    with open('testfiles/maddpg_adversary.results', 'wb') as file:
        pickle.dump(results, file)
