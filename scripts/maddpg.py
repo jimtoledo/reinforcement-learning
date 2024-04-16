@@ -457,7 +457,7 @@ class MADDPG():
             for agent in env.agents: ep_return[agent] += reward[agent] * gamma**t
         return ep_return
 
-    def train(self, env, gamma=1.0, num_episodes=100, batch_size=None, n_warmup_batches = 5, tau=0.005, target_update_steps=2, policy_update_steps=2, save_models=None, seed=None, evaluate=True):
+    def train(self, env, gamma=1.0, num_episodes=100, batch_size=None, n_warmup_batches = 5, tau=0.005, target_update_steps=2, policy_update_steps=2, save_models=None, seeds=[], evaluate=True):
         #NOTE: assuming env is instance of parallel_env, all agents available throughout entire episode length
         self.memory = self.memory_fn()
         self._init_agents(env, gamma, batch_size)
@@ -469,6 +469,7 @@ class MADDPG():
 
         i = 0
         for episode in tqdm(range(num_episodes)):
+            seed = np.random.choice(seeds).item() if len(seeds) else None
             state = env.reset(seed=seed)[0]
             ep_return = {agent: 0 for agent in self.agents}
             i = i % target_update_steps * policy_update_steps
@@ -582,8 +583,9 @@ if __name__ == '__main__':
     ),
     replay_buffer_fn = lambda : PrioritizedReplayBuffer(max_samples=1e6, alpha=0.0, beta0=0.0, beta_rate=1.0))
 
-    episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=10000, tau=0.01, batch_size=1024, save_models=[1, 500, 1000, 2000, 5000, 8000, 10000])
-    results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models}
+    seeds = np.random.randint(np.iinfo(np.int32).max, size=10, dtype=int)
+    episode_returns, best_model, saved_models = maddpg.train(env, gamma=0.95, num_episodes=10000, tau=0.01, batch_size=1024, seeds=seeds,save_models=[1, 500, 1000, 2000, 5000, 8000, 10000])
+    results = {'episode_returns': episode_returns, 'best_model': best_model, 'saved_models': saved_models, 'seeds': list(seeds)}
     import pickle
-    with open('testfiles/maddpg_adversary.results', 'wb') as file:
+    with open('testfiles/maddpg_adversary_seeded.results', 'wb') as file:
        pickle.dump(results, file)
