@@ -6,6 +6,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from tqdm import tqdm
 from tensordict import tensorclass
+from torchrl.data import ReplayBuffer, LazyTensorStorage
 
 @tensorclass
 class Experience:
@@ -83,18 +84,20 @@ class DRQN(nn.Module):
                              device=self.device, 
                              dtype=torch.float32)
             #x = x.unsqueeze(0)      
+        else:
+            x = x.to(self.device)
         return x
 
     #input shape: (sequence length, input size) | (sequence length, batch size, input size)
     def forward(self, inputs):
-        self._format(inputs)
+        inputs = self._format(inputs)
         outs = []
 
         batch_size = inputs.shape[1] if inputs.ndim == 3 else 0
         rnn_hidden_dims = self.rnn.weight_hh.shape[1]
 
         #batch process sequence
-        hx = torch.zeros(batch_size, rnn_hidden_dims) if batch_size else torch.zeros(rnn_hidden_dims) #initial RNN hidden layer
+        hx = torch.zeros(batch_size, rnn_hidden_dims, device=self.device) if batch_size else torch.zeros(rnn_hidden_dims, device=self.device) #initial RNN hidden layer
         for t in range(inputs.shape[0]): #sequence length
             inputs_t = inputs[t] #shape: (input size) | (batch size, input size)
             x = self.fc1(inputs_t)
@@ -109,14 +112,14 @@ class DRQN(nn.Module):
     
     #input shape: (sequence length, input size) | (sequence length, batch size, input size)
     def select_action(self, inputs):
-        self._format(inputs)
+        inputs = self._format(inputs)
         #return current action to be taken (end of sequence)
         #shape: (# actions) | (batch size, # actions)
         batch_size = inputs.shape[1] if inputs.ndim == 3 else 0
         rnn_hidden_dims = self.rnn.weight_hh.shape[1]
 
         #batch process sequence
-        hx = torch.zeros(batch_size, rnn_hidden_dims) if batch_size else torch.zeros(rnn_hidden_dims) #initial RNN hidden layer
+        hx = torch.zeros(batch_size, rnn_hidden_dims, device=self.device) if batch_size else torch.zeros(rnn_hidden_dims, device=self.device) #initial RNN hidden layer
         for t in range(inputs.shape[0]): #sequence length
             inputs_t = inputs[t] #shape: (input size) | (batch size, input size)
             x = self.fc1(inputs_t)
@@ -175,7 +178,45 @@ class DRQNLearner():
         #initialize optimizer
         self.optimizer = self.optimizer_fn(self.online_model.parameters(), lr=self.optimizer_lr)
 
-    def train(self, env, gamma=1.0, num_episodes=5000, max_episode_length=500, batch_size=32, n_warmup_batches = 1, tau=0.005, target_update_steps=1, save_models=None):
+    def _optimize_model(self):
+        batch = self.memory.sample(self.batch_size)
+
+        #(batch, sequence, sample) -> (sequence, batch, sample) for RNN input
+        states = batch.states.transpose(0, 1)
+        actions = batch.actions.transpose(0, 1)
+        next_states = batch.next_states.transpose(0, 1)
+
+        argmax_a_q_sp = self.online_model(next_states).max(-1, keepdim=True).indices #select best action of next state according to online model
+        #max_a_q_sp/target_q_sa shape: (batch, sequence, sample)
+        max_a_q_sp = self.target_model(next_states).detach().gather(dim=-1, index=argmax_a_q_sp).transpose(0, 1) #get values of next states using target network
+        target_q_sa = batch.rewards + (self.gamma * max_a_q_sp * (1 - batch.is_terminals)) #calculate q target
+
+        #q_sa shape: (batch, sequence, sample)
+        q_sa = self.online_model(states).gather(dim=-1, index=actions).transpose(0, 1) #get predicted q from model for each state, action pair
+
+        #don't include pad entries in loss calculation
+        loss = self.loss_fn((1 - batch.pad_masks) * q_sa, (1 - batch.pad_masks) * target_q_sa) #calculate loss between prediction and target
+
+        #optimize step (gradient descent)
+        self.optimizer.zero_grad()
+        loss.backward()
+        if self.max_gradient_norm:
+            torch.nn.utils.clip_grad_norm_(self.online_model.parameters(), self.max_gradient_norm)
+        self.optimizer.step()
+
+    def evaluate(self, env, gamma, seed=None):
+        state = env.reset(seed=seed)[0]
+        obs_history = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        ep_return = 0
+        for t in count():
+            action = self.online_model.select_action(obs_history).item()
+            state, reward, terminated, truncated, _ = env.step(action)
+            obs_history = torch.cat((obs_history, torch.tensor(state, dtype=torch.float32).unsqueeze(0)))
+            ep_return += reward * gamma**t
+            if terminated or truncated:
+                return ep_return
+
+    def train(self, env, gamma=1.0, num_episodes=5000, max_episode_length=500, batch_size=32, n_warmup_batches = 1, tau=0.005, target_update_steps=1, save_models=None, seeds=[], evaluate=True):
         if save_models: #list of episodes to save models
                 save_models.sort()
         self.gamma = gamma
@@ -188,7 +229,9 @@ class DRQNLearner():
         i = 0
         episode_returns = np.zeros(num_episodes)
         for episode in tqdm(range(num_episodes)):
-            state = env.reset()[0]
+            seed = np.random.choice(seeds).item() if len(seeds) else None
+            state = env.reset(seed=seed)[0]
+            obs_history = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
             ep_return = 0
             sequence = []
             #Experience() in episode loop
@@ -196,24 +239,25 @@ class DRQNLearner():
             #F.pad(stack., pad=(0, 0, max_episode_length - shape[0], ))
             for t in range(max_episode_length):
                 i += 1
-                action = self.exploration_strategy.select_action(self.online_model, state, env.action_space.n) #use online model to select action
+                action = self.exploration_strategy.select_action(self.online_model, obs_history, env.action_space.n) #use online model to select action
                 next_state, reward, terminated, truncated, _ = env.step(action)
 
                 sequence.append(Experience(*to_tensor(state, action, reward, next_state, terminated), torch.tensor([0]))) #add experience to episode sequence
 
                 state = next_state
+                obs_history = torch.cat((obs_history, torch.tensor(state, dtype=torch.float32).unsqueeze(0)))
                 ep_return += reward * gamma**t #add discounted reward to return
                 if terminated or truncated: break
 
-            #TODO: evaluate and save
+            if evaluate: ep_return = self.evaluate(env, gamma, seed)
             #save best model
             if ep_return >= episode_returns.max():
-                copy = self.value_model_fn(len(env.observation_space.sample()), env.action_space.n)
+                copy = self.DRQN_fn(len(env.observation_space.sample()), env.action_space.n)
                 copy.load_state_dict(self.online_model.state_dict())
                 best_model = copy
             #copy and save model
             if save_models and len(saved_models) < len(save_models) and episode+1 == save_models[len(saved_models)]:
-                copy = self.value_model_fn(len(env.observation_space.sample()), env.action_space.n)
+                copy = self.DRQN_fn(len(env.observation_space.sample()), env.action_space.n)
                 copy.load_state_dict(self.online_model.state_dict())
                 saved_models[episode+1] = copy
 
@@ -222,7 +266,9 @@ class DRQNLearner():
             history = torch.stack(sequence)
             #pad episode experience history to max_episode_length
             states, actions, rewards, next_states, is_terminals = left_pad(max_episode_length, history.states, history.actions, history.rewards, history.next_states, history.is_terminals)
-            pad_masks = left_pad(max_episode_length, history.pad_masks, value=1)
+            actions = actions.to(dtype=torch.int64)
+            pad_masks = left_pad(max_episode_length, history.pad_masks, value=1)[0]
+            #add to episode buffer
             self.memory.add(Experience(states, actions, rewards, next_states, is_terminals, pad_masks))
 
             if len(self.memory) >= batch_size*n_warmup_batches: #optimize online model
@@ -239,5 +285,17 @@ class DRQNLearner():
         return episode_returns, self.online_model, best_model, saved_models
 
 if __name__ == '__main__':
-    from torchrl.data import ReplayBuffer, LazyTensorStorage
-    replay_buffer = ReplayBuffer(storage=LazyTensorStorage(max_size=1000, device=torch.device("cuda")))
+    import gymnasium as gym
+    drqn = DRQNLearner(
+            DRQN_fn = lambda obs, nA: DRQN(obs, nA, fc1_hidden_dims=(64, 64), fc2_hidden_dims=(64, 64)),
+            exploration_strategy=EGreedyExpStrategy(min_epsilon=0.1),
+            optimizer_lr=0.003
+            )
+    env = gym.make('CartPole-v1')
+    episode_returns, final_model, best_model, saved_models = drqn.train(env, num_episodes=1000, tau=0.1, batch_size=128, save_models=[1, 250, 500, 750, 1000])
+    print(episode_returns.max())
+    print(episode_returns[-50:])
+    results = {'episode_returns': episode_returns, 'final_model': final_model, 'best_model': best_model, 'saved_models': saved_models}
+    import pickle
+    with open('testfiles/drqn_cartpole1.results', 'wb') as file:
+       pickle.dump(results, file)
