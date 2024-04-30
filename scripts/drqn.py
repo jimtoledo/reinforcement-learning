@@ -7,9 +7,10 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from tensordict import tensorclass
 from torchrl.data import ReplayBuffer, LazyTensorStorage
+import gymnasium
 
 @tensorclass
-class Experience:
+class Episode:
     states: torch.Tensor
     actions: torch.Tensor
     rewards: torch.Tensor
@@ -28,7 +29,7 @@ def to_tensor(*inputs):
         outs.append(out)
     return tuple(outs)
 
-def left_pad(length: int, *inputs: torch.Tensor, value: float=0):
+def left_pad(length: int, *inputs: torch.Tensor, value=0):
     '''
     Left-pads the input tensors to the specified length in the outermost (0) dimension and return
     '''
@@ -37,8 +38,9 @@ def left_pad(length: int, *inputs: torch.Tensor, value: float=0):
 #Deep Recurrent Q Network
 class DRQN(nn.Module):
 
-    def __init__(self, input_dim, output_dim, 
-                 fc1_hidden_dims = (), fc2_hidden_dims = (), rnn_dims = (64, 64), activation_fc = nn.ReLU, device=torch.device("cuda")):
+    def __init__(self, input_dim: int, output_dim: int, 
+                 fc1_hidden_dims: tuple[int, ...] = (), fc2_hidden_dims: tuple[int, ...] = (), rnn_dims: tuple[int, int] = (64, 64),
+                 activation_fc = nn.ReLU, device=torch.device("cuda")):
 
         super(DRQN, self).__init__()
         self.activation_fc = activation_fc
@@ -128,7 +130,6 @@ class DRQN(nn.Module):
         q = self.fc2(hx) #shape: (# actions) | (batch size, # actions)
 
         #return discrete (one-hot) action
-        #TODO: maybe convert tensor output to numpy?
         return q.detach().max(-1, keepdim=True).indices #output shape: (1) | (batch size, 1)
 
 class EGreedyExpStrategy():
@@ -170,7 +171,7 @@ class DRQNLearner():
         self.memory = replay_buffer
         self.max_gradient_norm = max_gradient_norm
 
-    def _init_model(self, env):
+    def _init_model(self, env: gymnasium.Env):
         #initialize online and target models
         self.online_model = self.DRQN_fn(len(env.observation_space.sample()), env.action_space.n)
         self.target_model = self.DRQN_fn(len(env.observation_space.sample()), env.action_space.n)
@@ -204,7 +205,7 @@ class DRQNLearner():
             torch.nn.utils.clip_grad_norm_(self.online_model.parameters(), self.max_gradient_norm)
         self.optimizer.step()
 
-    def evaluate(self, env, gamma, seed=None):
+    def evaluate(self, env: gymnasium.Env, gamma: float = 1.0, seed: int | None = None):
         state = env.reset(seed=seed)[0]
         obs_history = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
         ep_return = 0
@@ -216,7 +217,10 @@ class DRQNLearner():
             if terminated or truncated:
                 return ep_return
 
-    def train(self, env, gamma=1.0, num_episodes=5000, max_episode_length=500, batch_size=32, n_warmup_batches = 1, tau=0.005, target_update_steps=1, save_models=None, seeds=[], evaluate=True):
+    def train(self, env: gymnasium.Env, gamma: float = 1.0, num_episodes: int = 5000, max_episode_length: int = 500, 
+              batch_size: int = 32, n_warmup_batches: int = 1, tau: float = 0.005, target_update_steps: int = 1, 
+              save_models: list[int] | None = None, seeds: list[int] = [], evaluate: bool = True):
+        
         if save_models: #list of episodes to save models
                 save_models.sort()
         self.gamma = gamma
@@ -227,22 +231,19 @@ class DRQNLearner():
         best_model = None
 
         i = 0
-        episode_returns = np.zeros(num_episodes)
+        episode_returns = np.full(num_episodes, np.NINF)
         for episode in tqdm(range(num_episodes)):
             seed = np.random.choice(seeds).item() if len(seeds) else None
             state = env.reset(seed=seed)[0]
             obs_history = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
             ep_return = 0
             sequence = []
-            #Experience() in episode loop
-            #torch.stack() at end of episode
-            #F.pad(stack., pad=(0, 0, max_episode_length - shape[0], ))
             for t in range(max_episode_length):
                 i += 1
                 action = self.exploration_strategy.select_action(self.online_model, obs_history, env.action_space.n) #use online model to select action
                 next_state, reward, terminated, truncated, _ = env.step(action)
 
-                sequence.append(Experience(*to_tensor(state, action, reward, next_state, terminated), torch.tensor([0]))) #add experience to episode sequence
+                sequence.append(Episode(*to_tensor(state, action, reward, next_state, terminated), torch.tensor([0]))) #add experience to episode sequence
 
                 state = next_state
                 obs_history = torch.cat((obs_history, torch.tensor(state, dtype=torch.float32).unsqueeze(0)))
@@ -269,7 +270,7 @@ class DRQNLearner():
             actions = actions.to(dtype=torch.int64)
             pad_masks = left_pad(max_episode_length, history.pad_masks, value=1)[0]
             #add to episode buffer
-            self.memory.add(Experience(states, actions, rewards, next_states, is_terminals, pad_masks))
+            self.memory.add(Episode(states, actions, rewards, next_states, is_terminals, pad_masks))
 
             if len(self.memory) >= batch_size*n_warmup_batches: #optimize online model
                 self._optimize_model()
@@ -285,17 +286,35 @@ class DRQNLearner():
         return episode_returns, self.online_model, best_model, saved_models
 
 if __name__ == '__main__':
+    #CartPole
+    # import gymnasium as gym
+    # drqn = DRQNLearner(
+    #         DRQN_fn = lambda obs, nA: DRQN(obs, nA),
+    #         exploration_strategy=EGreedyExpStrategy(min_epsilon=0.1),
+    #         optimizer_lr=0.003
+    #         )
+    # env = gym.make('CartPole-v1')
+    # episode_returns, final_model, best_model, saved_models = drqn.train(env, num_episodes=1000, tau=0.07, batch_size=128, save_models=[1, 250, 500, 750, 1000])
+    # print(episode_returns.max())
+    # print(episode_returns[-50:])
+    # results = {'episode_returns': episode_returns, 'final_model': final_model, 'best_model': best_model, 'saved_models': saved_models}
+    # import pickle
+    # with open('testfiles/drqn_cartpole1.results', 'wb') as file:
+    #    pickle.dump(results, file)
+
+    #LunarLander
     import gymnasium as gym
+    from gymnasium.wrappers.time_limit import TimeLimit
+    env = TimeLimit(gym.make('LunarLander-v2'), max_episode_steps=1000)
     drqn = DRQNLearner(
-            DRQN_fn = lambda obs, nA: DRQN(obs, nA, fc1_hidden_dims=(64, 64), fc2_hidden_dims=(64, 64)),
-            exploration_strategy=EGreedyExpStrategy(min_epsilon=0.1),
+            DRQN_fn = lambda obs, nA: DRQN(obs, nA),
+            exploration_strategy=EGreedyExpStrategy(decay_steps=50000, min_epsilon=0.1),
             optimizer_lr=0.003
             )
-    env = gym.make('CartPole-v1')
-    episode_returns, final_model, best_model, saved_models = drqn.train(env, num_episodes=1000, tau=0.1, batch_size=128, save_models=[1, 250, 500, 750, 1000])
+    episode_returns, final_model, best_model, saved_models = drqn.train(env, gamma=0.95, num_episodes=1000, tau=0.07, batch_size=128, save_models=[1, 250, 500, 750, 1000], evaluate=False)
     print(episode_returns.max())
     print(episode_returns[-50:])
     results = {'episode_returns': episode_returns, 'final_model': final_model, 'best_model': best_model, 'saved_models': saved_models}
     import pickle
-    with open('testfiles/drqn_cartpole1.results', 'wb') as file:
+    with open('testfiles/drqn_lunarlander.results', 'wb') as file:
        pickle.dump(results, file)
