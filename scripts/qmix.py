@@ -149,6 +149,7 @@ class MultiAgentDRQN(nn.Module):
         self.input_dim = max(agent_obs_dims.values()) + last_action_input*self.output_dim + self.n_agents
 
         self.rnn = DRQN(self.input_dim, self.output_dim, fc1_hidden_dims, fc2_hidden_dims, rnn_dims, activation_fc, device)
+        self.device = device
 
     #_build_input(self, batch)
         #last action (t-1)
@@ -164,19 +165,19 @@ class MultiAgentDRQN(nn.Module):
             #F.one_hot(agent tensor, num_agents)
             #tensor.squeeze(-2)
         
-        #TODO: update comments to also reflect (seq length, num agents, *) shape
-        #Construct agent one-hot tensor: (batch size, seq length, num agents, num agents)
-        agent_one_hot = torch.empty(agent.shape, device=agent.device)
-        for n in agent.shape[-2]: #agents dim
+        #*NOTE*: batch size dimension optional
+        #Construct agent one-hot tensor: (*batch size, seq length, num agents, num agents)
+        agent_one_hot = torch.empty(agent.shape, dtype=torch.long, device=agent.device)
+        for n in range(agent.shape[-2]): #agents dim
             #convert agent id to agent index for all agent ids ([..., n]) in agent dim
             agent_one_hot[..., n, :] = torch.full(agent[..., n, :].shape, self.agent_id_to_idx[agent[0, ..., n, :].max().item()])
-        agent_one_hot = F.one_hot(agent_one_hot, self.n_agents).squeeze(-2) #shape: (batch size, seq length, num agents, 1) -> (batch size, seq length, num agents, num agents)
+        agent_one_hot = F.one_hot(agent_one_hot, self.n_agents).squeeze(-2) #shape: (*batch size, seq length, num agents, 1) -> (*batch size, seq length, num agents, num agents)
 
         
         if self.last_action_input:
-            #Construct last action one-hot tensor: (batch size, seq length, num agents, max(num available actions))
-            last_action_one_hot = torch.empty(action_history.shape, device=action_history.device) #shape: (batch size, seq length, num agents, 1)
-            last_action_one_hot = F.one_hot(last_action_one_hot, self.output_dim).squeeze(-2) #shape: (batch size, seq length, num agents, max(num available actions))
+            #Construct last action one-hot tensor: (*batch size, seq length, num agents, max(num available actions))
+            last_action_one_hot = torch.empty(action_history.shape, device=action_history.device) #shape: (*batch size, seq length, num agents, 1)
+            last_action_one_hot = F.one_hot(action_history, self.output_dim).squeeze(-2) #shape: (*batch size, seq length, num agents, max(num available actions))
             
             #last action at t = action at t-1 for all t>0
             for t in range(last_action_one_hot.shape[-3]-1, 0, -1):
@@ -184,6 +185,14 @@ class MultiAgentDRQN(nn.Module):
             #zero out last action for initial state
             last_action_one_hot[..., 0, :, :] = torch.zeros(last_action_one_hot[..., 0, :, :].shape)
 
+            #shape: (*batch size, seq length, num agents, obs dim + num agents + max(num available actions))
+            nn_input = torch.cat([obs_history, agent_one_hot, last_action_one_hot], dim=-1)
+        else:
+            nn_input = torch.cat([obs_history, agent_one_hot], dim=-1)
+        
+        if len(nn_input.shape) == 4: nn_input = nn_input.transpose(0, 1) #swap batch and sequence dims if batch input
+        if nn_input.device != self.device: nn_input = nn_input.to(self.device)
+        return nn_input
 
     #forward(self, batch)
         #reshape (sequence length, batch size, num agents, input size) -> (sequence length, batch size * num agents, input size)
@@ -207,3 +216,30 @@ NOTE: input to multi-agent DQRNN should be episode batch of shape (N, L, X)
         process episode batch from L=t+1=1 to L=t_max+1, where t_max is the max timestep of the longest episode in batch
     X = flattened feature vector (agent obs, agent last action, agent identifier)
 '''
+
+if __name__ == '__main__':
+    import time
+    agent_obs_dims = {1: 3, 4: 2, 2: 1, 7: 1}
+    agent_action_dims = {1: 3, 4: 2, 2: 1, 7: 1}
+    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
+    rnn1 = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
+
+    obs_history = torch.randn(5, 10, 4, 3)
+
+    agent = torch.zeros(5, 10, 4, 1)
+    for a in range(agent.shape[-2]):
+        agent[..., a, :] = torch.full(agent[..., a, :].shape, list(agent_action_dims.keys())[a])
+    
+    action_history = torch.randint(0, 3, (5, 10, 4, 1))
+
+    before = time.time()
+
+    a = rnn._build_input(obs_history, agent, action_history)
+
+    b = rnn._build_input(obs_history[0], agent[0], action_history[0])
+
+    c = rnn1._build_input(obs_history, agent, action_history)
+
+    d = rnn1._build_input(obs_history[0], agent[0], action_history[0])
+
+    print(time.time() - before)
