@@ -3,6 +3,7 @@ from itertools import count
 from tensordict import tensorclass
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 from collections.abc import Mapping
@@ -135,18 +136,54 @@ class MultiAgentDRQN(nn.Module):
         self.agent_obs_dims = agent_obs_dims #map agent id -> observation space dim
         self.agent_action_dims = agent_action_dims #map agent id -> # available actions
         self.last_action_input = last_action_input
+        
+        #map agent ids to {0, ..., n_agents-1} for one-hot encoding
+        agent_sorted = sorted(agent_obs_dims.keys())
+        self.agent_id_to_idx = {k:agent_sorted.index(k) for k in agent_obs_dims}
 
-        # num input features = max(observation space dim) + max(num available actions) (if using last action as input) + num agents (one-hot encoded agent ID)
-        input_dim = max(agent_obs_dims.values()) + last_action_input*max(agent_action_dims.values()) + len(agent_obs_dims)
+        self.n_agents = len(agent_obs_dims)
+
         # num output features = max(num available actions)
-        output_dim = max(agent_action_dims.values())
+        self.output_dim = max(agent_action_dims.values())
+        # num input features = max(observation space dim) + max(num available actions) (if using last action as input) + num agents (one-hot encoded agent ID)
+        self.input_dim = max(agent_obs_dims.values()) + last_action_input*self.output_dim + self.n_agents
 
-        self.rnn = DRQN(input_dim, output_dim, fc1_hidden_dims, fc2_hidden_dims, rnn_dims, activation_fc, device)
+        self.rnn = DRQN(self.input_dim, self.output_dim, fc1_hidden_dims, fc2_hidden_dims, rnn_dims, activation_fc, device)
 
     #_build_input(self, batch)
         #last action (t-1)
         #agent id one-hot encoding
         #torch cat [obs, last action, agent id one-hot encoded], dim=-1
+        #transpose 0,1
+    
+    def _build_input(self, obs_history: torch.Tensor, agent: torch.Tensor, action_history: torch.Tensor | None = None) -> torch.Tensor:
+        #Tensor shapes: (batch size, seq length, num agents, *) | (seq length, num agents, *)
+        #batch = episode batch -> tensor with shape (sequence length, batch size, num agents, input size)
+        #batch.* shape = (batch size, sequence length, num agents, * dim)
+        #agent one-hot:
+            #F.one_hot(agent tensor, num_agents)
+            #tensor.squeeze(-2)
+        
+        #TODO: update comments to also reflect (seq length, num agents, *) shape
+        #Construct agent one-hot tensor: (batch size, seq length, num agents, num agents)
+        agent_one_hot = torch.empty(agent.shape, device=agent.device)
+        for n in agent.shape[-2]: #agents dim
+            #convert agent id to agent index for all agent ids ([..., n]) in agent dim
+            agent_one_hot[..., n, :] = torch.full(agent[..., n, :].shape, self.agent_id_to_idx[agent[0, ..., n, :].max().item()])
+        agent_one_hot = F.one_hot(agent_one_hot, self.n_agents).squeeze(-2) #shape: (batch size, seq length, num agents, 1) -> (batch size, seq length, num agents, num agents)
+
+        
+        if self.last_action_input:
+            #Construct last action one-hot tensor: (batch size, seq length, num agents, max(num available actions))
+            last_action_one_hot = torch.empty(action_history.shape, device=action_history.device) #shape: (batch size, seq length, num agents, 1)
+            last_action_one_hot = F.one_hot(last_action_one_hot, self.output_dim).squeeze(-2) #shape: (batch size, seq length, num agents, max(num available actions))
+            
+            #last action at t = action at t-1 for all t>0
+            for t in range(last_action_one_hot.shape[-3]-1, 0, -1):
+                last_action_one_hot[..., t, :, :] = last_action_one_hot[..., t-1, :, :]
+            #zero out last action for initial state
+            last_action_one_hot[..., 0, :, :] = torch.zeros(last_action_one_hot[..., 0, :, :].shape)
+
 
     #forward(self, batch)
         #reshape (sequence length, batch size, num agents, input size) -> (sequence length, batch size * num agents, input size)
