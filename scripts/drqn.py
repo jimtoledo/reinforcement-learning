@@ -205,7 +205,7 @@ class DRQNLearner():
             torch.nn.utils.clip_grad_norm_(self.online_model.parameters(), self.max_gradient_norm)
         self.optimizer.step()
 
-    def evaluate(self, env: gymnasium.Env, gamma: float = 1.0, seed: int | None = None):
+    def evaluate(self, env: gymnasium.Env, gamma: float = 1.0, seed: int | None = None) -> float:
         state = env.reset(seed=seed)[0]
         obs_history = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
         ep_return = 0
@@ -215,10 +215,11 @@ class DRQNLearner():
             obs_history = torch.cat((obs_history, torch.tensor(state, dtype=torch.float32).unsqueeze(0)))
             ep_return += reward * gamma**t
             if terminated or truncated:
-                return ep_return
+                break
+        return ep_return
 
     def train(self, env: gymnasium.Env, gamma: float = 1.0, num_episodes: int = 5000, max_episode_length: int = 500, 
-              batch_size: int = 32, n_warmup_batches: int = 1, tau: float = 0.005, target_update_steps: int = 1, 
+              batch_size: int = 32, n_warmup_batches: int = 1, online_update_steps: int = 1, tau: float = 0.005, target_update_steps: int = 1, 
               save_models: list[int] | None = None, seeds: list[int] = [], evaluate: bool = True):
         
         if save_models: #list of episodes to save models
@@ -272,7 +273,7 @@ class DRQNLearner():
             #add to episode buffer
             self.memory.add(Episode(states, actions, rewards, next_states, is_terminals, pad_masks))
 
-            if len(self.memory) >= batch_size*n_warmup_batches: #optimize online model
+            if i % online_update_steps == 0 and len(self.memory) >= batch_size*n_warmup_batches: #optimize online model
                 self._optimize_model()
 
             #update target network with tau
@@ -305,13 +306,13 @@ if __name__ == '__main__':
     #LunarLander
     import gymnasium as gym
     from gymnasium.wrappers.time_limit import TimeLimit
-    env = TimeLimit(gym.make('LunarLander-v2'), max_episode_steps=1000)
+    env = TimeLimit(gym.make('LunarLander-v2'), max_episode_steps=500)
     drqn = DRQNLearner(
             DRQN_fn = lambda obs, nA: DRQN(obs, nA),
-            exploration_strategy=EGreedyExpStrategy(decay_steps=50000, min_epsilon=0.1),
-            optimizer_lr=0.003
+            exploration_strategy=EGreedyExpStrategy(decay_steps=500000, min_epsilon=0.1),
+            optimizer_lr=0.005
             )
-    episode_returns, final_model, best_model, saved_models = drqn.train(env, gamma=0.95, num_episodes=1000, tau=0.07, batch_size=128, save_models=[1, 250, 500, 750, 1000], evaluate=False)
+    episode_returns, final_model, best_model, saved_models = drqn.train(env, gamma=0.99, num_episodes=2000, tau=0.05, batch_size=128, save_models=[1, 500, 1000], evaluate=False)
     print(episode_returns.max())
     print(episode_returns[-50:])
     results = {'episode_returns': episode_returns, 'final_model': final_model, 'best_model': best_model, 'saved_models': saved_models}
