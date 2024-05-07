@@ -138,8 +138,8 @@ class MultiAgentDRQN(nn.Module):
         self.last_action_input = last_action_input
         
         #map agent ids to {0, ..., n_agents-1} for one-hot encoding
-        agent_sorted = sorted(agent_obs_dims.keys())
-        self.agent_id_to_idx = {k:agent_sorted.index(k) for k in agent_obs_dims}
+        self.agent_sorted = sorted(agent_obs_dims.keys())
+        self.agent_id_to_idx = {k:self.agent_sorted.index(k) for k in agent_obs_dims}
 
         self.n_agents = len(agent_obs_dims)
 
@@ -158,13 +158,8 @@ class MultiAgentDRQN(nn.Module):
         #transpose 0,1
     
     def _build_input(self, obs_history: torch.Tensor, agent: torch.Tensor, action_history: torch.Tensor | None = None) -> torch.Tensor:
-        #Tensor shapes: (batch size, seq length, num agents, *) | (seq length, num agents, *)
-        #batch = episode batch -> tensor with shape (sequence length, batch size, num agents, input size)
-        #batch.* shape = (batch size, sequence length, num agents, * dim)
-        #agent one-hot:
-            #F.one_hot(agent tensor, num_agents)
-            #tensor.squeeze(-2)
-        
+        #Tensor shapes: (*batch size, seq length, num agents, *) | (seq length, num agents, *)
+
         #*NOTE*: batch size dimension optional
         #Construct agent one-hot tensor: (*batch size, seq length, num agents, num agents)
         agent_one_hot = torch.empty(agent.shape, dtype=torch.long, device=agent.device)
@@ -192,12 +187,27 @@ class MultiAgentDRQN(nn.Module):
         
         if len(nn_input.shape) == 4: nn_input = nn_input.transpose(0, 1) #swap batch and sequence dims if batch input
         if nn_input.device != self.device: nn_input = nn_input.to(self.device)
-        return nn_input
+        return nn_input #Tensor shape: (seq length, *batch size, num agents, self.input_dim)
 
     #forward(self, batch)
         #reshape (sequence length, batch size, num agents, input size) -> (sequence length, batch size * num agents, input size)
         #forward self.rnn
         #reshape (sequence length, batch size * num agents, input size) -> (sequence length, batch size, num agents, input size)
+    def forward(self, obs_history: torch.Tensor, agent: torch.Tensor, action_history: torch.Tensor | None = None) -> torch.Tensor:
+        #*NOTE*: batch size dimension optional
+        nn_input = self._build_input(obs_history, agent, action_history) #shape: (seq length, *batch size, num agents, input dim)
+        input_shape = tuple(nn_input.shape[:-1])
+        nn_input = nn_input.flatten(1, -2) #shape: (seq length, num agents, input size) | (seq length, batch size * num agents, input size)
+        output = self.rnn(nn_input)
+        output = output.reshape(*input_shape, self.output_dim) #shape: (seq length, *batch size, num agents, output dim)
+        if len(output.shape) == 4: output = output.transpose(0, 1) #swap batch and sequence dims if batch input
+        return output #shape: (*batch size, seq length, num agents, output dim)
+
+
+    def select_action(self, obs_history: torch.Tensor, agent: int, action_history: torch.Tensor | None = None) -> torch.Tensor:
+        #Tensor shapes: (*batch size, seq length, num agents, *) | (seq length, num agents, *)
+        agent_tensor = torch.full(obs_history[..., 0].unsqueeze(-1).shape, agent, dtype=torch.long, device=obs_history.device) #shape: (*batch size, seq length, num agents, 1)
+        return self._build_input(obs_history, agent_tensor, action_history)
 
     #observation and agent's last action (one-hot encoded) as input
     #all samples from episode batch through MLP -> GRU -> MLP
@@ -241,5 +251,12 @@ if __name__ == '__main__':
     c = rnn1._build_input(obs_history, agent, action_history)
 
     d = rnn1._build_input(obs_history[0], agent[0], action_history[0])
+
+    e = rnn1.select_action(obs_history, 4, action_history)
+
+    f = rnn1.select_action(obs_history[0], 4, action_history[0])
+
+    g = rnn(obs_history, agent, action_history)
+    h = rnn(obs_history[0], agent[0], action_history[0])
 
     print(time.time() - before)
