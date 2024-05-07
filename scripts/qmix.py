@@ -150,12 +150,6 @@ class MultiAgentDRQN(nn.Module):
 
         self.rnn = DRQN(self.input_dim, self.output_dim, fc1_hidden_dims, fc2_hidden_dims, rnn_dims, activation_fc, device)
         self.device = device
-
-    #_build_input(self, batch)
-        #last action (t-1)
-        #agent id one-hot encoding
-        #torch cat [obs, last action, agent id one-hot encoded], dim=-1
-        #transpose 0,1
     
     def _build_input(self, obs_history: torch.Tensor, agent: torch.Tensor, action_history: torch.Tensor | None = None) -> torch.Tensor:
         #Tensor shapes: (*batch size, seq length, num agents, *) | (seq length, num agents, *)
@@ -189,28 +183,36 @@ class MultiAgentDRQN(nn.Module):
         if nn_input.device != self.device: nn_input = nn_input.to(self.device)
         return nn_input #Tensor shape: (seq length, *batch size, num agents, self.input_dim)
 
-    #forward(self, batch)
-        #reshape (sequence length, batch size, num agents, input size) -> (sequence length, batch size * num agents, input size)
-        #forward self.rnn
-        #reshape (sequence length, batch size * num agents, input size) -> (sequence length, batch size, num agents, input size)
     def forward(self, obs_history: torch.Tensor, agent: torch.Tensor, action_history: torch.Tensor | None = None) -> torch.Tensor:
         #*NOTE*: batch size dimension optional
+        #NOTE: agent tensor assumes that for all a in [0, ..., num agents-1]: agent[..., a, :] is filled with a single value
         nn_input = self._build_input(obs_history, agent, action_history) #shape: (seq length, *batch size, num agents, input dim)
         input_shape = tuple(nn_input.shape[:-1])
         nn_input = nn_input.flatten(1, -2) #shape: (seq length, num agents, input size) | (seq length, batch size * num agents, input size)
-        output = self.rnn(nn_input)
-        output = output.reshape(*input_shape, self.output_dim) #shape: (seq length, *batch size, num agents, output dim)
-        if len(output.shape) == 4: output = output.transpose(0, 1) #swap batch and sequence dims if batch input
-        return output #shape: (*batch size, seq length, num agents, output dim)
+        nn_output = self.rnn(nn_input)
+        nn_output = nn_output.reshape(*input_shape, self.output_dim) #shape: (seq length, *batch size, num agents, output dim)
+        if len(nn_output.shape) == 4: nn_output = nn_output.transpose(0, 1) #swap batch and sequence dims if batch input
+        #nn_output shape: (*batch size, seq length, num agents, output dim)
+
+        #Calculate max values and actions for each agent
+        #shape: (seq length, *batch size, num agents)
+        max_values = torch.empty(nn_output.shape[:-1], device=self.device)
+        max_actions = torch.empty(nn_output.shape[:-1], device=self.device)
+        for n in range(agent.shape[-2]): #agents dim
+            agent_id = agent[0, ..., n, :].max().item()
+            action_dim = self.agent_action_dims[agent_id]
+            agent_output = nn_output[..., n, :action_dim] #shape: (*batch size, seq length, agent action dim)
+            agent_max = agent_output.max(-1)
+            max_values[..., n], max_actions[..., n] = agent_max.values, agent_max.indices
+
+        return nn_output, max_values, max_actions
 
 
     def select_action(self, obs_history: torch.Tensor, agent: int, action_history: torch.Tensor | None = None) -> torch.Tensor:
-        #Tensor shapes: (*batch size, seq length, num agents, *) | (seq length, num agents, *)
-        agent_tensor = torch.full(obs_history[..., 0].unsqueeze(-1).shape, agent, dtype=torch.long, device=obs_history.device) #shape: (*batch size, seq length, num agents, 1)
-        return self._build_input(obs_history, agent_tensor, action_history)
-
-    #observation and agent's last action (one-hot encoded) as input
-    #all samples from episode batch through MLP -> GRU -> MLP
+        #Tensor shapes: (*batch size, seq length, *) | (seq length, *)
+        obs_history, action_history = obs_history.unsqueeze(-2), action_history.unsqueeze(-2) #add 'num agents' dim of size 1 
+        agent_tensor = torch.full(obs_history[..., 0].unsqueeze(-1).shape, agent, dtype=torch.long, device=obs_history.device) #shape: (*batch size, seq length, 1, 1)
+        return self(obs_history, agent_tensor, action_history)[2].squeeze(-1)
 
 #QMIX Mixing network
 class QMixer(nn.Module):
@@ -252,11 +254,18 @@ if __name__ == '__main__':
 
     d = rnn1._build_input(obs_history[0], agent[0], action_history[0])
 
-    e = rnn1.select_action(obs_history, 4, action_history)
+    e = rnn1.select_action(obs_history[..., 1, :], 4, action_history[..., 1, :])
 
-    f = rnn1.select_action(obs_history[0], 4, action_history[0])
+    f = rnn1.select_action(obs_history[0,..., 1, :], 4, action_history[0, ..., 1, :])
 
     g = rnn(obs_history, agent, action_history)
     h = rnn(obs_history[0], agent[0], action_history[0])
-
+    optimizer = optim.RMSprop(rnn.parameters(), 1e-4)
+    for _ in range(20):
+        g = rnn(obs_history, agent, action_history)
+        loss = nn.MSELoss()(g[1], torch.zeros(g[1].shape, device=g[1].device))
+        print(loss)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
     print(time.time() - before)
