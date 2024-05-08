@@ -136,6 +136,8 @@ class MultiAgentDRQN(nn.Module):
         self.agent_obs_dims = agent_obs_dims #map agent id -> observation space dim
         self.agent_action_dims = agent_action_dims #map agent id -> # available actions
         self.last_action_input = last_action_input
+
+        self.obs_dim = max(agent_obs_dims.values())
         
         #map agent ids to {0, ..., n_agents-1} for one-hot encoding
         self.agent_sorted = sorted(agent_obs_dims.keys())
@@ -146,7 +148,7 @@ class MultiAgentDRQN(nn.Module):
         # num output features = max(num available actions)
         self.output_dim = max(agent_action_dims.values())
         # num input features = max(observation space dim) + max(num available actions) (if using last action as input) + num agents (one-hot encoded agent ID)
-        self.input_dim = max(agent_obs_dims.values()) + last_action_input*self.output_dim + self.n_agents
+        self.input_dim = self.obs_dim + last_action_input*self.output_dim + self.n_agents
 
         self.rnn = DRQN(self.input_dim, self.output_dim, fc1_hidden_dims, fc2_hidden_dims, rnn_dims, activation_fc, device)
         self.device = device
@@ -197,7 +199,7 @@ class MultiAgentDRQN(nn.Module):
         #Calculate max values and actions for each agent
         #shape: (seq length, *batch size, num agents)
         max_values = torch.empty(nn_output.shape[:-1], device=self.device)
-        max_actions = torch.empty(nn_output.shape[:-1], device=self.device)
+        max_actions = torch.empty(nn_output.shape[:-1], device=self.device, dtype=torch.long)
         for n in range(agent.shape[-2]): #agents dim
             agent_id = agent[0, ..., n, :].max().item()
             action_dim = self.agent_action_dims[agent_id]
@@ -210,9 +212,19 @@ class MultiAgentDRQN(nn.Module):
 
     def select_action(self, obs_history: torch.Tensor, agent: int, action_history: torch.Tensor | None = None) -> torch.Tensor:
         #Tensor shapes: (*batch size, seq length, *) | (seq length, *)
-        obs_history, action_history = obs_history.unsqueeze(-2), action_history.unsqueeze(-2) #add 'num agents' dim of size 1 
+        if obs_history.shape[-1] < self.obs_dim:
+            obs_history = F.pad(obs_history, (0, self.obs_dim-obs_history.shape[-1]) + 2*tuple(0 for _ in range(len(obs_history.shape)-1)), value=0)
+        if self.last_action_input:
+            #0-filled tensor at current t
+            if action_history is None:
+                action_history = torch.zeros(obs_history.shape[:-1], dtype=torch.long, device=obs_history.device).unsqueeze(-1)
+            else:
+                action_history = torch.cat([action_history, torch.zeros_like(action_history[..., 0, :].unsqueeze(-2))], dim=-2)
+            
+            action_history = action_history.unsqueeze(-2)
+        obs_history = obs_history.unsqueeze(-2) #add 'num agents' dim of size 1 
         agent_tensor = torch.full(obs_history[..., 0].unsqueeze(-1).shape, agent, dtype=torch.long, device=obs_history.device) #shape: (*batch size, seq length, 1, 1)
-        return self(obs_history, agent_tensor, action_history)[2].squeeze(-1)
+        return self(obs_history, agent_tensor, action_history)[2].detach().cpu()
 
 #QMIX Mixing network
 class QMixer(nn.Module):
@@ -230,42 +242,79 @@ NOTE: input to multi-agent DQRNN should be episode batch of shape (N, L, X)
 '''
 
 if __name__ == '__main__':
-    import time
-    agent_obs_dims = {1: 3, 4: 2, 2: 1, 7: 1}
-    agent_action_dims = {1: 3, 4: 2, 2: 1, 7: 1}
-    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
-    rnn1 = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
+    # import time
+    # agent_obs_dims = {1: 3, 4: 2, 2: 1, 7: 1}
+    # agent_action_dims = {1: 3, 4: 2, 2: 1, 7: 1}
+    # rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
+    # rnn1 = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
 
-    obs_history = torch.randn(5, 10, 4, 3)
+    # obs_history = torch.randn(5, 10, 4, 3)
 
-    agent = torch.zeros(5, 10, 4, 1)
-    for a in range(agent.shape[-2]):
-        agent[..., a, :] = torch.full(agent[..., a, :].shape, list(agent_action_dims.keys())[a])
+    # agent = torch.zeros(5, 10, 4, 1)
+    # for a in range(agent.shape[-2]):
+    #     agent[..., a, :] = torch.full(agent[..., a, :].shape, list(agent_action_dims.keys())[a])
     
-    action_history = torch.randint(0, 3, (5, 10, 4, 1))
+    # action_history = torch.randint(0, 3, (5, 10, 4, 1))
 
-    before = time.time()
+    # before = time.time()
 
-    a = rnn._build_input(obs_history, agent, action_history)
+    # a = rnn._build_input(obs_history, agent, action_history)
 
-    b = rnn._build_input(obs_history[0], agent[0], action_history[0])
+    # b = rnn._build_input(obs_history[0], agent[0], action_history[0])
 
-    c = rnn1._build_input(obs_history, agent, action_history)
+    # c = rnn1._build_input(obs_history, agent, action_history)
 
-    d = rnn1._build_input(obs_history[0], agent[0], action_history[0])
+    # d = rnn1._build_input(obs_history[0], agent[0], action_history[0])
 
-    e = rnn1.select_action(obs_history[..., 1, :], 4, action_history[..., 1, :])
+    # e = rnn1.select_action(obs_history[..., 1, :], 4, action_history[..., 1, :])
 
-    f = rnn1.select_action(obs_history[0,..., 1, :], 4, action_history[0, ..., 1, :])
+    # f = rnn1.select_action(obs_history[0,..., 1, :], 4, action_history[0, ..., 1, :])
 
-    g = rnn(obs_history, agent, action_history)
-    h = rnn(obs_history[0], agent[0], action_history[0])
-    optimizer = optim.RMSprop(rnn.parameters(), 1e-4)
-    for _ in range(20):
-        g = rnn(obs_history, agent, action_history)
-        loss = nn.MSELoss()(g[1], torch.zeros(g[1].shape, device=g[1].device))
-        print(loss)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    print(time.time() - before)
+    # g = rnn(obs_history, agent, action_history)
+    # h = rnn(obs_history[0], agent[0], action_history[0])
+    # optimizer = optim.RMSprop(rnn.parameters(), 1e-4)
+    # for _ in range(20):
+    #     g = rnn(obs_history, agent, action_history)
+    #     loss = nn.MSELoss()(g[1], torch.zeros(g[1].shape, device=g[1].device))
+    #     print(loss)
+    #     optimizer.zero_grad()
+    #     loss.backward()
+    #     optimizer.step()
+    # print(time.time() - before)
+
+    from pettingzoo.mpe import simple_speaker_listener_v4
+    env = simple_speaker_listener_v4.env()
+
+    agent_ids = {agent: id for id, agent in enumerate(env.possible_agents)}
+    agent_obs_dims = {id: env.observation_space(agent).shape[0] for id, agent in enumerate(env.possible_agents)}
+    agent_action_dims = {id: env.action_space(agent).n for id, agent in enumerate(env.possible_agents)}
+    #rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
+    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
+
+    env.reset()
+    obs_history = {}
+    act_history = {}
+    for agent in env.agent_iter():
+        state, reward, terminated, truncated, _ = env.last()
+        if agent in obs_history:
+            obs_history[agent] = torch.cat((obs_history[agent], torch.tensor(state, dtype=torch.float32).unsqueeze(0)))
+        else:
+            obs_history[agent] = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        
+        if terminated or truncated:
+            env.step(None)
+            if agent in act_history:
+                act_history[agent] = torch.cat((act_history[agent], torch.zeros(1, 1, dtype=torch.long)))
+            else:
+                act_history[agent] = torch.zeros(1, 1, dtype=torch.long)
+            
+        else:
+            action = rnn.select_action(obs_history[agent], agent_ids[agent], act_history[agent] if agent in act_history else None)[-1]
+            env.step(action.item())
+
+            if agent in act_history:
+                act_history[agent] = torch.cat((act_history[agent], torch.tensor(action, dtype=torch.long).unsqueeze(0)))
+            else:
+                act_history[agent] = torch.tensor(action, dtype=torch.long).unsqueeze(0)
+                pass
+    print('done')
