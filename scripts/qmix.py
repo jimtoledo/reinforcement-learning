@@ -197,7 +197,7 @@ class MultiAgentDRQN(nn.Module):
         #nn_output shape: (*batch size, seq length, num agents, output dim)
 
         #Calculate max values and actions for each agent
-        #shape: (seq length, *batch size, num agents)
+        #shape: (*batch size, seq length, num agents)
         max_values = torch.empty(nn_output.shape[:-1], device=self.device)
         max_actions = torch.empty(nn_output.shape[:-1], device=self.device, dtype=torch.long)
         for n in range(agent.shape[-2]): #agents dim
@@ -212,7 +212,7 @@ class MultiAgentDRQN(nn.Module):
 
     def select_action(self, obs_history: torch.Tensor, agent: int, action_history: torch.Tensor | None = None) -> torch.Tensor:
         #Tensor shapes: (*batch size, seq length, *) | (seq length, *)
-        if obs_history.shape[-1] < self.obs_dim:
+        if obs_history.shape[-1] < self.obs_dim: #pad obs dim if needed
             obs_history = F.pad(obs_history, (0, self.obs_dim-obs_history.shape[-1]) + 2*tuple(0 for _ in range(len(obs_history.shape)-1)), value=0)
         if self.last_action_input:
             #0-filled tensor at current t
@@ -221,10 +221,24 @@ class MultiAgentDRQN(nn.Module):
             else:
                 action_history = torch.cat([action_history, torch.zeros_like(action_history[..., 0, :].unsqueeze(-2))], dim=-2)
             
-            action_history = action_history.unsqueeze(-2)
+            action_history = action_history.unsqueeze(-2) #add 'num agents' dim of size 1 
         obs_history = obs_history.unsqueeze(-2) #add 'num agents' dim of size 1 
         agent_tensor = torch.full(obs_history[..., 0].unsqueeze(-1).shape, agent, dtype=torch.long, device=obs_history.device) #shape: (*batch size, seq length, 1, 1)
-        return self(obs_history, agent_tensor, action_history)[2].detach().cpu()
+        #return action to take at current t (shape: (*batch size, 1))
+        return self(obs_history, agent_tensor, action_history)[2].detach().cpu()[..., -1, :]
+    
+    def select_actions(self, obs_history: torch.Tensor, agent_tensor: torch.Tensor, action_history: torch.Tensor | None = None) -> torch.Tensor:
+        #Tensor shapes: (*batch size, seq length, num agents, *) | (seq length, num agents, *)
+        if obs_history.shape[-1] < self.obs_dim: #pad obs dim if needed
+            obs_history = F.pad(obs_history, (0, self.obs_dim-obs_history.shape[-1]) + 2*tuple(0 for _ in range(len(obs_history.shape)-1)), value=0)
+        if self.last_action_input:
+            #0-filled tensor at current t
+            if action_history is None:
+                action_history = torch.zeros(obs_history.shape[:-1], dtype=torch.long, device=obs_history.device).unsqueeze(-1)
+            else:
+                action_history = torch.cat([action_history, torch.zeros_like(action_history[..., 0, :, :].unsqueeze(-3))], dim=-3)
+        #return action to take at current t (shape: (*batch size, num agents))
+        return self(obs_history, agent_tensor, action_history)[2].detach().cpu()[..., -1, :]
 
 #QMIX Mixing network
 class QMixer(nn.Module):
@@ -288,8 +302,8 @@ if __name__ == '__main__':
     agent_ids = {agent: id for id, agent in enumerate(env.possible_agents)}
     agent_obs_dims = {id: env.observation_space(agent).shape[0] for id, agent in enumerate(env.possible_agents)}
     agent_action_dims = {id: env.action_space(agent).n for id, agent in enumerate(env.possible_agents)}
-    #rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
-    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
+    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
+    #rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
 
     env.reset()
     obs_history = {}
@@ -309,12 +323,12 @@ if __name__ == '__main__':
                 act_history[agent] = torch.zeros(1, 1, dtype=torch.long)
             
         else:
-            action = rnn.select_action(obs_history[agent], agent_ids[agent], act_history[agent] if agent in act_history else None)[-1]
+            action = rnn.select_action(obs_history[agent], agent_ids[agent], act_history[agent] if agent in act_history else None)
             env.step(action.item())
 
             if agent in act_history:
-                act_history[agent] = torch.cat((act_history[agent], torch.tensor(action, dtype=torch.long).unsqueeze(0)))
+                act_history[agent] = torch.cat((act_history[agent], action.unsqueeze(0)))
             else:
-                act_history[agent] = torch.tensor(action, dtype=torch.long).unsqueeze(0)
+                act_history[agent] = action.unsqueeze(0)
                 pass
     print('done')
