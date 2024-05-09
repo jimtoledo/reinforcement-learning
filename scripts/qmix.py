@@ -375,6 +375,13 @@ if __name__ == '__main__':
     agent_obs_dims = {id: env.observation_space(agent).shape[0] for id, agent in enumerate(env.possible_agents)}
     agent_action_dims = {id: env.action_space(agent).n for id, agent in enumerate(env.possible_agents)}
     rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
+    agent_state_idxs = {}
+    
+    idx = 0
+    for agent in env.possible_agents:
+        obs_length = env.observation_space(agent).shape[0]
+        agent_state_idxs[agent] = slice(idx, idx+obs_length)
+        idx += obs_length
 
     #NOTE: assume env observation space is flattened (1 dimension) array
     #NOTE: assume discrete action space
@@ -387,7 +394,6 @@ if __name__ == '__main__':
     next_state_history = torch.zeros(SEQ_LENGTH, sum(agent_obs_dims.values()))
     next_obs_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, rnn.obs_dim, dtype=torch.float32) # L = max(obs space length) 
     is_term_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, 1, dtype=torch.bool) #L = 1
-    #TODO: global state info for QMIXhypernetwork
 
     pad_mask = torch.ones(SEQ_LENGTH, rnn.n_agents, 1, dtype=torch.bool) #L = 1, pad=1 by default, set to 0 within episode loop
     agent_id = torch.zeros_like(act_history) #L = 1
@@ -400,8 +406,11 @@ if __name__ == '__main__':
         if not env.agents or t==20: break
         actions = {} #agent: action dict to pass to env.step function
         for agent in env.agents:
+            #store agent obs at time t
+            obs = torch.tensor(state[agent])
+            state_history[t, agent_state_idxs[agent]] = obs #shared state history
             idx = rnn.agent_id_to_idx[agent_ids[agent]]
-            obs_history[t, idx] = right_pad(rnn.obs_dim, torch.tensor(state[agent])) #store agent obs at time t
+            obs_history[t, idx] = right_pad(rnn.obs_dim, obs) #individual obs history
             
             action = rnn.select_action(obs_history[:t+1, idx], agent_ids[agent], act_history[:t+1, idx])
             act_history[t, idx] = action #store agent action at time t
@@ -410,9 +419,13 @@ if __name__ == '__main__':
         state, reward, terminated, truncated, _ = env.step(actions)
 
         for agent in env.agents:
+            #store agent next obs at time t
+            obs = torch.tensor(state[agent])
+            next_state_history[t, agent_state_idxs[agent]] = obs
             idx = rnn.agent_id_to_idx[agent_ids[agent]]
-            reward_history[t, idx, 0] = reward[agent] #store agent reward at time t
-            next_obs_history[t, idx] = right_pad(rnn.obs_dim, torch.tensor(state[agent])) #store agent next obs at time t
+            next_obs_history[t, idx] = right_pad(rnn.obs_dim, obs) #individual obs history
+
+            reward_history[t, idx, 0] = reward[agent]
             is_term_history[t, idx, 0] = terminated[agent]
             pad_mask[t, idx, 0] = False
 
