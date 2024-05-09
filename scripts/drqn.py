@@ -27,13 +27,25 @@ def to_tensor(*inputs):
         out = torch.tensor(input, dtype=torch.float32)
         if not out.shape: out = out.unsqueeze(0) #ensure tensor has at least 1 dimension
         outs.append(out)
-    return tuple(outs)
+    return tuple(outs) if len(outs) > 1 else outs[0]
 
-def left_pad(length: int, *inputs: torch.Tensor, value=0):
+def left_pad(length: int, *inputs: torch.Tensor, dim: int = 0, value=0):
     '''
-    Left-pads the input tensors to the specified length in the outermost (0) dimension and return
+    Left-pads the input tensors to the specified length in the given dimension and return
     '''
-    return tuple(F.pad(input, 2*tuple(0 for _ in range(len(input.shape)-1)) + (length-input.shape[0], 0), value=value) for input in inputs)
+    inputs = tuple(input.transpose(0, dim) for input in inputs) #swap with outermost dimension
+    #pad outermost dimension, then swap dims back
+    outs = tuple(F.pad(input, 2*tuple(0 for _ in range(len(input.shape)-1)) + (length-input.shape[0], 0), value=value).transpose(0, dim) for input in inputs)
+    return outs if len(outs) > 1 else outs[0]
+
+def right_pad(length: int, *inputs: torch.Tensor, dim: int = 0, value=0):
+    '''
+    Right-pads the input tensors to the specified length in the given dimension and return
+    '''
+    inputs = tuple(input.transpose(0, dim) for input in inputs) #swap with outermost dimension
+    #pad outermost dimension, then swap dims back
+    outs = tuple(F.pad(input, 2*tuple(0 for _ in range(len(input.shape)-1)) + (0, length-input.shape[0]), value=value).transpose(0, dim) for input in inputs)
+    return outs if len(outs) > 1 else outs[0]
 
 #Deep Recurrent Q Network
 class DRQN(nn.Module):
@@ -269,7 +281,7 @@ class DRQNLearner():
             #pad episode experience history to max_episode_length
             states, actions, rewards, next_states, is_terminals = left_pad(max_episode_length, history.states, history.actions, history.rewards, history.next_states, history.is_terminals)
             actions = actions.to(dtype=torch.int64)
-            pad_masks = left_pad(max_episode_length, history.pad_masks, value=1)[0]
+            pad_masks = left_pad(max_episode_length, history.pad_masks, value=1)
             #add to episode buffer
             self.memory.add(Episode(states, actions, rewards, next_states, is_terminals, pad_masks))
 
