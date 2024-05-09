@@ -19,12 +19,43 @@ NOTE: if param sharing (generally if agents have the same observation and action
 @tensorclass
 class Episode:
     states: torch.Tensor
-    actions: torch.Tensor
-    rewards: torch.Tensor
-    next_states: torch.Tensor 
-    is_terminals: torch.Tensor
-    agent: torch.Tensor
-    pad_masks: torch.Tensor #shape [*, 1]: signal if padded to fill sequence
+    obs: torch.Tensor #agents dim needed
+    actions: torch.Tensor #agents dim needed
+    rewards: torch.Tensor #agents dim needed
+    next_states: torch.Tensor
+    next_obs: torch.Tensor #agents dim needed
+    is_terminals: torch.Tensor #agents dim needed
+    agents: torch.Tensor #shape [*, 1]: agent ids, agents dim needed
+    pad_masks: torch.Tensor #shape [*, 1]: signal if padded to fill sequence, agents dim needed
+
+def to_tensor(*inputs):
+    '''
+    Transforms inputs into tensors and return
+    '''
+    outs = []
+    for input in inputs:
+        out = torch.tensor(input, dtype=torch.float32)
+        if not out.shape: out = out.unsqueeze(0) #ensure tensor has at least 1 dimension
+        outs.append(out)
+    return tuple(outs) if len(outs) > 1 else outs[0]
+
+def left_pad(length: int, *inputs: torch.Tensor, dim: int = 0, value=0):
+    '''
+    Left-pads the input tensors to the specified length in the given dimension and return
+    '''
+    inputs = tuple(input.transpose(0, dim) for input in inputs) #swap with outermost dimension
+    #pad outermost dimension, then swap dims back
+    outs = tuple(F.pad(input, 2*tuple(0 for _ in range(len(input.shape)-1)) + (length-input.shape[0], 0), value=value).transpose(0, dim) for input in inputs)
+    return outs if len(outs) > 1 else outs[0]
+
+def right_pad(length: int, *inputs: torch.Tensor, dim: int = 0, value=0):
+    '''
+    Right-pads the input tensors to the specified length in the given dimension and return
+    '''
+    inputs = tuple(input.transpose(0, dim) for input in inputs) #swap with outermost dimension
+    #pad outermost dimension, then swap dims back
+    outs = tuple(F.pad(input, 2*tuple(0 for _ in range(len(input.shape)-1)) + (0, length-input.shape[0]), value=value).transpose(0, dim) for input in inputs)
+    return outs if len(outs) > 1 else outs[0]
 
 #Deep Recurrent Q Network
 class DRQN(nn.Module):
@@ -161,7 +192,8 @@ class MultiAgentDRQN(nn.Module):
         agent_one_hot = torch.empty(agent.shape, dtype=torch.long, device=agent.device)
         for n in range(agent.shape[-2]): #agents dim
             #convert agent id to agent index for all agent ids ([..., n]) in agent dim
-            agent_one_hot[..., n, :] = torch.full(agent[..., n, :].shape, self.agent_id_to_idx[agent[0, ..., n, :].max().item()])
+            #agent_one_hot[..., n, :] = torch.full(agent[..., n, :].shape, self.agent_id_to_idx[agent[0, ..., n, :].max().item()])
+            agent_one_hot[..., n, :] = self.agent_id_to_idx[agent[0, ..., n, :].max().item()]
         agent_one_hot = F.one_hot(agent_one_hot, self.n_agents).squeeze(-2) #shape: (*batch size, seq length, num agents, 1) -> (*batch size, seq length, num agents, num agents)
 
         
@@ -174,7 +206,8 @@ class MultiAgentDRQN(nn.Module):
             for t in range(last_action_one_hot.shape[-3]-1, 0, -1):
                 last_action_one_hot[..., t, :, :] = last_action_one_hot[..., t-1, :, :]
             #zero out last action for initial state
-            last_action_one_hot[..., 0, :, :] = torch.zeros(last_action_one_hot[..., 0, :, :].shape)
+            #last_action_one_hot[..., 0, :, :] = torch.zeros(last_action_one_hot[..., 0, :, :].shape)
+            last_action_one_hot[..., 0, :, :] = 0
 
             #shape: (*batch size, seq length, num agents, obs dim + num agents + max(num available actions))
             nn_input = torch.cat([obs_history, agent_one_hot, last_action_one_hot], dim=-1)
@@ -213,13 +246,14 @@ class MultiAgentDRQN(nn.Module):
     def select_action(self, obs_history: torch.Tensor, agent: int, action_history: torch.Tensor | None = None) -> torch.Tensor:
         #Tensor shapes: (*batch size, seq length, *) | (seq length, *)
         if obs_history.shape[-1] < self.obs_dim: #pad obs dim if needed
-            obs_history = F.pad(obs_history, (0, self.obs_dim-obs_history.shape[-1]) + 2*tuple(0 for _ in range(len(obs_history.shape)-1)), value=0)
+            #obs_history = F.pad(obs_history, (0, self.obs_dim-obs_history.shape[-1]) + 2*tuple(0 for _ in range(len(obs_history.shape)-1)), value=0)
+            obs_history = right_pad(self.obs_dim, obs_history, dim=-1)
         if self.last_action_input:
             #0-filled tensor at current t
-            if action_history is None:
+            if action_history is None or not len(action_history):
                 action_history = torch.zeros(obs_history.shape[:-1], dtype=torch.long, device=obs_history.device).unsqueeze(-1)
-            else:
-                action_history = torch.cat([action_history, torch.zeros_like(action_history[..., 0, :].unsqueeze(-2))], dim=-2)
+            elif action_history.shape[-2] < obs_history.shape[-2]:
+                action_history = right_pad(obs_history.shape[-2], action_history, dim=-2)
             
             action_history = action_history.unsqueeze(-2) #add 'num agents' dim of size 1 
         obs_history = obs_history.unsqueeze(-2) #add 'num agents' dim of size 1 
@@ -230,13 +264,14 @@ class MultiAgentDRQN(nn.Module):
     def select_actions(self, obs_history: torch.Tensor, agent_tensor: torch.Tensor, action_history: torch.Tensor | None = None) -> torch.Tensor:
         #Tensor shapes: (*batch size, seq length, num agents, *) | (seq length, num agents, *)
         if obs_history.shape[-1] < self.obs_dim: #pad obs dim if needed
-            obs_history = F.pad(obs_history, (0, self.obs_dim-obs_history.shape[-1]) + 2*tuple(0 for _ in range(len(obs_history.shape)-1)), value=0)
+            #obs_history = F.pad(obs_history, (0, self.obs_dim-obs_history.shape[-1]) + 2*tuple(0 for _ in range(len(obs_history.shape)-1)), value=0)
+            obs_history = right_pad(self.obs_dim, obs_history, dim=-1)
         if self.last_action_input:
             #0-filled tensor at current t
-            if action_history is None:
+            if action_history is None or not len(action_history):
                 action_history = torch.zeros(obs_history.shape[:-1], dtype=torch.long, device=obs_history.device).unsqueeze(-1)
-            else:
-                action_history = torch.cat([action_history, torch.zeros_like(action_history[..., 0, :, :].unsqueeze(-3))], dim=-3)
+            elif action_history.shape[-3] < obs_history.shape[-3]:
+                action_history = right_pad(obs_history.shape[-3], action_history, dim=-3)
         #return action to take at current t (shape: (*batch size, num agents))
         return self(obs_history, agent_tensor, action_history)[2].detach().cpu()[..., -1, :]
 
@@ -297,38 +332,91 @@ if __name__ == '__main__':
     # print(time.time() - before)
 
     from pettingzoo.mpe import simple_speaker_listener_v4
-    env = simple_speaker_listener_v4.env()
+    # env = simple_speaker_listener_v4.env()
+
+    # agent_ids = {agent: id for id, agent in enumerate(env.possible_agents)}
+    # agent_obs_dims = {id: env.observation_space(agent).shape[0] for id, agent in enumerate(env.possible_agents)}
+    # agent_action_dims = {id: env.action_space(agent).n for id, agent in enumerate(env.possible_agents)}
+    # rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
+    #rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
+
+    # env.reset()
+    # obs_history = {}
+    # act_history = {}
+    # for agent in env.agent_iter():
+    #     state, reward, terminated, truncated, _ = env.last()
+    #     if agent in obs_history:
+    #         obs_history[agent] = torch.cat((obs_history[agent], torch.tensor(state, dtype=torch.float32).unsqueeze(0)))
+    #     else:
+    #         obs_history[agent] = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        
+    #     if terminated or truncated:
+    #         env.step(None)
+    #         if agent in act_history:
+    #             act_history[agent] = torch.cat((act_history[agent], torch.zeros(1, 1, dtype=torch.long)))
+    #         else:
+    #             act_history[agent] = torch.zeros(1, 1, dtype=torch.long)
+            
+    #     else:
+    #         action = rnn.select_action(obs_history[agent], agent_ids[agent], act_history[agent] if agent in act_history else None)
+    #         env.step(action.item())
+
+    #         if agent in act_history:
+    #             act_history[agent] = torch.cat((act_history[agent], action.unsqueeze(0)))
+    #         else:
+    #             act_history[agent] = action.unsqueeze(0)
+    #             pass
+    # print('serial done')
+
+    SEQ_LENGTH = 25
+    env = simple_speaker_listener_v4.parallel_env(max_cycles=SEQ_LENGTH)
 
     agent_ids = {agent: id for id, agent in enumerate(env.possible_agents)}
     agent_obs_dims = {id: env.observation_space(agent).shape[0] for id, agent in enumerate(env.possible_agents)}
     agent_action_dims = {id: env.action_space(agent).n for id, agent in enumerate(env.possible_agents)}
     rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
-    #rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
 
-    env.reset()
-    obs_history = {}
-    act_history = {}
-    for agent in env.agent_iter():
-        state, reward, terminated, truncated, _ = env.last()
-        if agent in obs_history:
-            obs_history[agent] = torch.cat((obs_history[agent], torch.tensor(state, dtype=torch.float32).unsqueeze(0)))
-        else:
-            obs_history[agent] = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        
-        if terminated or truncated:
-            env.step(None)
-            if agent in act_history:
-                act_history[agent] = torch.cat((act_history[agent], torch.zeros(1, 1, dtype=torch.long)))
-            else:
-                act_history[agent] = torch.zeros(1, 1, dtype=torch.long)
+    #NOTE: assume env observation space is flattened (1 dimension) array
+    #NOTE: assume discrete action space
+
+    #dims = (seq length, num agents, L)
+    state_history = torch.zeros(SEQ_LENGTH, sum(agent_obs_dims.values()))
+    obs_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, rnn.obs_dim, dtype=torch.float32) #L = max(obs space length) 
+    act_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, 1, dtype=torch.long) #L = 1
+    reward_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, 1, dtype=torch.float32) #L = 1
+    next_state_history = torch.zeros(SEQ_LENGTH, sum(agent_obs_dims.values()))
+    next_obs_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, rnn.obs_dim, dtype=torch.float32) # L = max(obs space length) 
+    is_term_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, 1, dtype=torch.bool) #L = 1
+    #TODO: global state info for QMIXhypernetwork
+
+    pad_mask = torch.ones(SEQ_LENGTH, rnn.n_agents, 1, dtype=torch.bool) #L = 1, pad=1 by default, set to 0 within episode loop
+    agent_id = torch.zeros_like(act_history) #L = 1
+    for id in agent_ids.values():
+        idx = rnn.agent_id_to_idx[id]
+        agent_id[:, idx, 0] = id
+
+    state = env.reset()[0]
+    for t in count():
+        if not env.agents or t==20: break
+        actions = {} #agent: action dict to pass to env.step function
+        for agent in env.agents:
+            idx = rnn.agent_id_to_idx[agent_ids[agent]]
+            obs_history[t, idx] = right_pad(rnn.obs_dim, torch.tensor(state[agent])) #store agent obs at time t
             
-        else:
-            action = rnn.select_action(obs_history[agent], agent_ids[agent], act_history[agent] if agent in act_history else None)
-            env.step(action.item())
+            action = rnn.select_action(obs_history[:t+1, idx], agent_ids[agent], act_history[:t+1, idx])
+            act_history[t, idx] = action #store agent action at time t
+            actions[agent] = action.item()
 
-            if agent in act_history:
-                act_history[agent] = torch.cat((act_history[agent], action.unsqueeze(0)))
-            else:
-                act_history[agent] = action.unsqueeze(0)
-                pass
-    print('done')
+        state, reward, terminated, truncated, _ = env.step(actions)
+
+        for agent in env.agents:
+            idx = rnn.agent_id_to_idx[agent_ids[agent]]
+            reward_history[t, idx, 0] = reward[agent] #store agent reward at time t
+            next_obs_history[t, idx] = right_pad(rnn.obs_dim, torch.tensor(state[agent])) #store agent next obs at time t
+            is_term_history[t, idx, 0] = terminated[agent]
+            pad_mask[t, idx, 0] = False
+
+        #store stuff
+    episode = Episode(state_history, obs_history, act_history, reward_history, next_state_history, next_obs_history, is_term_history, agent_id, pad_mask)
+
+    print('parallel env done')
