@@ -184,16 +184,17 @@ class MultiAgentDRQN(nn.Module):
         self.rnn = DRQN(self.input_dim, self.output_dim, fc1_hidden_dims, fc2_hidden_dims, rnn_dims, activation_fc, device)
         self.device = device
     
-    def _build_input(self, obs_history: torch.Tensor, agent: torch.Tensor, action_history: torch.Tensor | None = None) -> torch.Tensor:
+    def _build_input(self, obs_history: torch.Tensor, agent_ids: list[int] | tuple[int, ...], action_history: torch.Tensor | None = None) -> torch.Tensor:
+        #agent_ids is list/tuple where index->id matches that of the agents dim in the obs_history/action_history tensor
         #Tensor shapes: (*batch size, seq length, num agents, *) | (seq length, num agents, *)
 
         #*NOTE*: batch size dimension optional
         #Construct agent one-hot tensor: (*batch size, seq length, num agents, num agents)
-        agent_one_hot = torch.empty(agent.shape, dtype=torch.long, device=agent.device)
-        for n in range(agent.shape[-2]): #agents dim
+        agent_one_hot = torch.empty(obs_history[..., 0].unsqueeze(-1).shape, dtype=torch.long, device=obs_history.device) #shape: (*batch size, seq length, num agents, 1)
+        for idx, id in enumerate(agent_ids): #order of agent_ids should match that of agents dim
             #convert agent id to agent index for all agent ids ([..., n]) in agent dim
             #agent_one_hot[..., n, :] = torch.full(agent[..., n, :].shape, self.agent_id_to_idx[agent[0, ..., n, :].max().item()])
-            agent_one_hot[..., n, :] = self.agent_id_to_idx[agent[0, ..., n, :].max().item()]
+            agent_one_hot[..., idx, :] = self.agent_id_to_idx[id]
         agent_one_hot = F.one_hot(agent_one_hot, self.n_agents).squeeze(-2) #shape: (*batch size, seq length, num agents, 1) -> (*batch size, seq length, num agents, num agents)
 
         
@@ -218,10 +219,11 @@ class MultiAgentDRQN(nn.Module):
         if nn_input.device != self.device: nn_input = nn_input.to(self.device)
         return nn_input #Tensor shape: (seq length, *batch size, num agents, self.input_dim)
 
-    def forward(self, obs_history: torch.Tensor, agent: torch.Tensor, action_history: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, obs_history: torch.Tensor, agent_ids: list[int] | tuple[int, ...], action_history: torch.Tensor | None = None) -> torch.Tensor:
+        #agent_ids is list/tuple where index->id matches that of the agents dim in the obs_history/action_history tensor
         #*NOTE*: batch size dimension optional
         #NOTE: agent tensor assumes that for all a in [0, ..., num agents-1]: agent[..., a, :] is filled with a single value
-        nn_input = self._build_input(obs_history, agent, action_history) #shape: (seq length, *batch size, num agents, input dim)
+        nn_input = self._build_input(obs_history, agent_ids, action_history) #shape: (seq length, *batch size, num agents, input dim)
         input_shape = tuple(nn_input.shape[:-1])
         nn_input = nn_input.flatten(1, -2) #shape: (seq length, num agents, input size) | (seq length, batch size * num agents, input size)
         nn_output = self.rnn(nn_input)
@@ -233,12 +235,11 @@ class MultiAgentDRQN(nn.Module):
         #shape: (*batch size, seq length, num agents)
         max_values = torch.empty(nn_output.shape[:-1], device=self.device)
         max_actions = torch.empty(nn_output.shape[:-1], device=self.device, dtype=torch.long)
-        for n in range(agent.shape[-2]): #agents dim
-            agent_id = agent[0, ..., n, :].max().item()
-            action_dim = self.agent_action_dims[agent_id]
-            agent_output = nn_output[..., n, :action_dim] #shape: (*batch size, seq length, agent action dim)
+        for idx, id in enumerate(agent_ids): #agents dim
+            action_dim = self.agent_action_dims[id]
+            agent_output = nn_output[..., idx, :action_dim] #shape: (*batch size, seq length, agent action dim)
             agent_max = agent_output.max(-1)
-            max_values[..., n], max_actions[..., n] = agent_max.values, agent_max.indices
+            max_values[..., idx], max_actions[..., idx] = agent_max.values, agent_max.indices
 
         return nn_output, max_values, max_actions
 
@@ -257,11 +258,10 @@ class MultiAgentDRQN(nn.Module):
             
             action_history = action_history.unsqueeze(-2) #add 'num agents' dim of size 1 
         obs_history = obs_history.unsqueeze(-2) #add 'num agents' dim of size 1 
-        agent_tensor = torch.full(obs_history[..., 0].unsqueeze(-1).shape, agent, dtype=torch.long, device=obs_history.device) #shape: (*batch size, seq length, 1, 1)
         #return action to take at current t (shape: (*batch size, 1))
-        return self(obs_history, agent_tensor, action_history)[2].detach().cpu()[..., -1, :]
+        return self(obs_history, (agent,), action_history)[2].detach().cpu()[..., -1, :]
     
-    def select_actions(self, obs_history: torch.Tensor, agent_tensor: torch.Tensor, action_history: torch.Tensor | None = None) -> torch.Tensor:
+    def select_actions(self, obs_history: torch.Tensor, agent_ids: list[int] | tuple[int, ...], action_history: torch.Tensor | None = None) -> torch.Tensor:
         #Tensor shapes: (*batch size, seq length, num agents, *) | (seq length, num agents, *)
         if obs_history.shape[-1] < self.obs_dim: #pad obs dim if needed
             #obs_history = F.pad(obs_history, (0, self.obs_dim-obs_history.shape[-1]) + 2*tuple(0 for _ in range(len(obs_history.shape)-1)), value=0)
@@ -273,7 +273,7 @@ class MultiAgentDRQN(nn.Module):
             elif action_history.shape[-3] < obs_history.shape[-3]:
                 action_history = right_pad(obs_history.shape[-3], action_history, dim=-3)
         #return action to take at current t (shape: (*batch size, num agents))
-        return self(obs_history, agent_tensor, action_history)[2].detach().cpu()[..., -1, :]
+        return self(obs_history, agent_ids, action_history)[2].detach().cpu()[..., -1, :]
 
 #QMIX Mixing network
 class QMixer(nn.Module):
@@ -299,28 +299,26 @@ if __name__ == '__main__':
 
     # obs_history = torch.randn(5, 10, 4, 3)
 
-    # agent = torch.zeros(5, 10, 4, 1)
-    # for a in range(agent.shape[-2]):
-    #     agent[..., a, :] = torch.full(agent[..., a, :].shape, list(agent_action_dims.keys())[a])
-    
+    # agent = list(agent_obs_dims.keys())
+
     # action_history = torch.randint(0, 3, (5, 10, 4, 1))
 
     # before = time.time()
 
     # a = rnn._build_input(obs_history, agent, action_history)
 
-    # b = rnn._build_input(obs_history[0], agent[0], action_history[0])
+    # b = rnn._build_input(obs_history[0], agent, action_history[0])
 
     # c = rnn1._build_input(obs_history, agent, action_history)
 
-    # d = rnn1._build_input(obs_history[0], agent[0], action_history[0])
+    # d = rnn1._build_input(obs_history[0], agent, action_history[0])
 
-    # e = rnn1.select_action(obs_history[..., 1, :], 4, action_history[..., 1, :])
+    # e = rnn1.select_action(obs_history[..., 1, :], 7, action_history[..., 1, :])
 
-    # f = rnn1.select_action(obs_history[0,..., 1, :], 4, action_history[0, ..., 1, :])
+    # f = rnn1.select_action(obs_history[0,..., 1, :], 7, action_history[0, ..., 1, :])
 
     # g = rnn(obs_history, agent, action_history)
-    # h = rnn(obs_history[0], agent[0], action_history[0])
+    # h = rnn(obs_history[0], (agent[0], ), action_history[0])
     # optimizer = optim.RMSprop(rnn.parameters(), 1e-4)
     # for _ in range(20):
     #     g = rnn(obs_history, agent, action_history)
@@ -338,7 +336,7 @@ if __name__ == '__main__':
     # agent_obs_dims = {id: env.observation_space(agent).shape[0] for id, agent in enumerate(env.possible_agents)}
     # agent_action_dims = {id: env.action_space(agent).n for id, agent in enumerate(env.possible_agents)}
     # rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
-    #rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
+    # rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
 
     # env.reset()
     # obs_history = {}
@@ -431,5 +429,5 @@ if __name__ == '__main__':
 
         #store stuff
     episode = Episode(state_history, obs_history, act_history, reward_history, next_state_history, next_obs_history, is_term_history, agent_id, pad_mask)
-
+    #TODO: replace agent tensor param to agent_idx_to_id mapping
     print('parallel env done')
