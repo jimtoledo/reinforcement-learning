@@ -227,7 +227,7 @@ class MultiAgentDRQN(nn.Module):
         input_shape = tuple(nn_input.shape[:-1])
         nn_input = nn_input.flatten(1, -2) #shape: (seq length, num agents, input size) | (seq length, batch size * num agents, input size)
         nn_output = self.rnn(nn_input)
-        nn_output = nn_output.reshape(*input_shape, self.output_dim) #shape: (seq length, *batch size, num agents, output dim)
+        nn_output = nn_output.view(*input_shape, self.output_dim) #shape: (seq length, *batch size, num agents, output dim)
         if len(nn_output.shape) == 4: nn_output = nn_output.transpose(0, 1) #swap batch and sequence dims if batch input
         #nn_output shape: (*batch size, seq length, num agents, output dim)
 
@@ -277,7 +277,53 @@ class MultiAgentDRQN(nn.Module):
 
 #QMIX Mixing network
 class QMixer(nn.Module):
-    pass
+    #n mixing layers, n agents (hypernetwork output), state dim (for hypernetwork), hypernetwork hidden layers, 
+    #mixing network: n_agents -> hidden layers -> 1
+    #hypernet: state dim -> hidden layers -> mixing network weights/biases
+    def __init__(self, n_agents: int, state_shape: tuple[int, ...] | torch.Size, mixer_hidden_dims: tuple[int, ...] = (32,), hypernet_hidden_dims: tuple[int, ...] | None = (64,)):
+        super(QMixer, self).__init__()
+        
+        self.n_agents = n_agents
+        self.state_dim = int(np.prod(state_shape))
+
+        #Build extra hypernet hidden layers if len(hypernet_hidden_dims) > 2
+        hypernet_hidden = nn.ModuleList()
+        for i in range(len(hypernet_hidden_dims)-1):
+            hypernet_hidden.append(nn.Linear(hypernet_hidden_dims[i], hypernet_hidden_dims[i+1]))
+            hypernet_hidden.append(nn.ReLU())
+        
+        #If len(hypernet_hidden_dims) > 1, initial + hidden layers
+        hypernet_init = nn.Sequential(
+            nn.Linear(self.state_dim, hypernet_hidden_dims[0]),
+            nn.ReLU(),
+            *hypernet_hidden
+        ) if hypernet_hidden_dims else None
+        
+        #Build weights for mixer layers with hypernetwork
+        self.mixer_hidden_weights = nn.ModuleList()
+        for i, dim in enumerate(mixer_hidden_dims):
+            if i == 0: #Q_agent inputs -> first hidden layer
+                hypernet_out_dim = self.n_agents * dim
+            else:
+                hypernet_out_dim = dim * mixer_hidden_dims[i-1]
+            
+            #Hypernet layers -> mixer weights
+            weights = nn.Sequential(
+                hypernet_init,
+                nn.Linear(hypernet_hidden_dims[-1], hypernet_out_dim)
+            ) if hypernet_init else nn.Linear(self.state_dim, hypernet_out_dim)
+
+            self.mixer_weights.append(weights)
+        
+        #Weights for final mixer layer->Q_total
+        self.mixer_final_weights = nn.Sequential(
+            hypernet_init,
+            nn.Linear(hypernet_hidden_dims[-1], mixer_hidden_dims[-1])
+        ) if hypernet_init else nn.Linear(self.state_dim, mixer_hidden_dims[-1])
+        
+        #Weights use ReLU between hidden layers -> abs activation function
+        #Make biases single linear layer, and final bias use hypernet hidden dims
+        #The first bias is produced by a hypernetwork with a single linear layer, and the final bias is produced by a two-layer hypernetwork with a ReLU nonlinearity
 
 class QMIX():
     pass
@@ -291,43 +337,43 @@ NOTE: input to multi-agent DQRNN should be episode batch of shape (N, L, X)
 '''
 
 if __name__ == '__main__':
-    # import time
-    # agent_obs_dims = {1: 3, 4: 2, 2: 1, 7: 1}
-    # agent_action_dims = {1: 3, 4: 2, 2: 1, 7: 1}
-    # rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
-    # rnn1 = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
+    import time
+    agent_obs_dims = {1: 3, 4: 2, 2: 1, 7: 1}
+    agent_action_dims = {1: 3, 4: 2, 2: 1, 7: 1}
+    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
+    rnn1 = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
 
-    # obs_history = torch.randn(5, 10, 4, 3)
+    obs_history = torch.randn(5, 10, 4, 3)
 
-    # agent = list(agent_obs_dims.keys())
+    agent = list(agent_obs_dims.keys())
 
-    # action_history = torch.randint(0, 3, (5, 10, 4, 1))
+    action_history = torch.randint(0, 3, (5, 10, 4, 1))
 
-    # before = time.time()
+    before = time.time()
 
-    # a = rnn._build_input(obs_history, agent, action_history)
+    a = rnn(obs_history, agent, action_history)
 
-    # b = rnn._build_input(obs_history[0], agent, action_history[0])
+    b = rnn(obs_history[0], agent, action_history[0])
 
     # c = rnn1._build_input(obs_history, agent, action_history)
 
     # d = rnn1._build_input(obs_history[0], agent, action_history[0])
 
-    # e = rnn1.select_action(obs_history[..., 1, :], 7, action_history[..., 1, :])
+    e = rnn1.select_action(obs_history[..., 1, :], 7, action_history[..., 1, :])
 
-    # f = rnn1.select_action(obs_history[0,..., 1, :], 7, action_history[0, ..., 1, :])
+    f = rnn1.select_action(obs_history[0,..., 1, :], 7, action_history[0, ..., 1, :])
 
-    # g = rnn(obs_history, agent, action_history)
-    # h = rnn(obs_history[0], (agent[0], ), action_history[0])
-    # optimizer = optim.RMSprop(rnn.parameters(), 1e-4)
-    # for _ in range(20):
-    #     g = rnn(obs_history, agent, action_history)
-    #     loss = nn.MSELoss()(g[1], torch.zeros(g[1].shape, device=g[1].device))
-    #     print(loss)
-    #     optimizer.zero_grad()
-    #     loss.backward()
-    #     optimizer.step()
-    # print(time.time() - before)
+    g = rnn(obs_history, agent, action_history)
+    h = rnn(obs_history[0], (agent[0], ), action_history[0])
+    optimizer = optim.RMSprop(rnn.parameters(), 1e-4)
+    for _ in range(20):
+        g = rnn(obs_history, agent, action_history)
+        loss = nn.MSELoss()(g[1], torch.zeros(g[1].shape, device=g[1].device))
+        print(loss)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    print(time.time() - before)
 
     from pettingzoo.mpe import simple_speaker_listener_v4
     # env = simple_speaker_listener_v4.env()
