@@ -280,31 +280,36 @@ class QMixer(nn.Module):
     #n mixing layers, n agents (hypernetwork output), state dim (for hypernetwork), hypernetwork hidden layers, 
     #mixing network: n_agents -> hidden layers -> 1
     #hypernet: state dim -> hidden layers -> mixing network weights/biases
-    def __init__(self, n_agents: int, state_shape: tuple[int, ...] | torch.Size, mixer_hidden_dims: tuple[int, ...] = (32,), hypernet_hidden_dims: tuple[int, ...] | None = (64,)):
+    def __init__(self, agent_ids: list[int] | tuple[int, ...], state_shape: tuple[int, ...] | torch.Size | int, mixer_hidden_dims: tuple[int, ...] = (32,), hypernet_hidden_dims: tuple[int, ...] | None = (64,)):
         super(QMixer, self).__init__()
         
-        self.n_agents = n_agents
-        self.state_dim = int(np.prod(state_shape))
+        self.n_agents = len(agent_ids)
+        self.agent_sorted = sorted(agent_ids)
+        self.agent_id_to_idx = {k:self.agent_sorted.index(k) for k in agent_ids}
+        self.state_dim = state_shape if type(state_shape) == int else int(np.prod(state_shape))
 
-        #Build extra hypernet hidden layers if len(hypernet_hidden_dims) > 2
-        hypernet_hidden = nn.ModuleList()
-        for i in range(len(hypernet_hidden_dims)-1):
-            hypernet_hidden.append(nn.Linear(hypernet_hidden_dims[i], hypernet_hidden_dims[i+1]))
-            hypernet_hidden.append(nn.ReLU())
+        hypernet_init = None
+        if hypernet_hidden_dims:
+            #Build extra hypernet hidden layers if len(hypernet_hidden_dims) > 2
+            hypernet_hidden = nn.ModuleList()
+            for i in range(len(hypernet_hidden_dims)-1):
+                hypernet_hidden.append(nn.Linear(hypernet_hidden_dims[i], hypernet_hidden_dims[i+1]))
+                hypernet_hidden.append(nn.ReLU())
         
-        #If len(hypernet_hidden_dims) > 1, initial + hidden layers
-        hypernet_init = nn.Sequential(
-            nn.Linear(self.state_dim, hypernet_hidden_dims[0]),
-            nn.ReLU(),
-            *hypernet_hidden
-        ) if hypernet_hidden_dims else None
+            #If len(hypernet_hidden_dims) > 1, initial + hidden layers
+            hypernet_init = nn.Sequential(
+                nn.Linear(self.state_dim, hypernet_hidden_dims[0]),
+                nn.ReLU(),
+                *hypernet_hidden
+            )
         
-        #Build weights for mixer layers with hypernetwork
+        #Build weights and biases for mixer layers with hypernetwork
         self.mixer_hidden_weights = nn.ModuleList()
+        self.mixer_hidden_bias = nn.ModuleList()
         for i, dim in enumerate(mixer_hidden_dims):
-            if i == 0: #Q_agent inputs -> first hidden layer
+            if i == 0: #Weights for Q_agent inputs -> first hidden layer
                 hypernet_out_dim = self.n_agents * dim
-            else:
+            else: #Weights for hidden layer i-1 -> hidden layer i
                 hypernet_out_dim = dim * mixer_hidden_dims[i-1]
             
             #Hypernet layers -> mixer weights
@@ -313,7 +318,11 @@ class QMixer(nn.Module):
                 nn.Linear(hypernet_hidden_dims[-1], hypernet_out_dim)
             ) if hypernet_init else nn.Linear(self.state_dim, hypernet_out_dim)
 
-            self.mixer_weights.append(weights)
+            #Bias from single linear layer hypernetwork
+            bias = nn.Linear(self.state_dim, dim)
+
+            self.mixer_hidden_weights.append(weights)
+            self.mixer_hidden_bias.append(bias)
         
         #Weights for final mixer layer->Q_total
         self.mixer_final_weights = nn.Sequential(
@@ -321,9 +330,23 @@ class QMixer(nn.Module):
             nn.Linear(hypernet_hidden_dims[-1], mixer_hidden_dims[-1])
         ) if hypernet_init else nn.Linear(self.state_dim, mixer_hidden_dims[-1])
         
-        #Weights use ReLU between hidden layers -> abs activation function
-        #Make biases single linear layer, and final bias use hypernet hidden dims
-        #The first bias is produced by a hypernetwork with a single linear layer, and the final bias is produced by a two-layer hypernetwork with a ReLU nonlinearity
+        #V(S) instead of bias for last layers
+        self.V_S = nn.Sequential(
+            hypernet_init,
+            nn.Linear(hypernet_hidden_dims[-1], 1)
+        ) if hypernet_init else nn.Sequential( #if no hypernet hidden dims, construct 2 layer hypernetwork using first mixer hidden dim
+            nn.Linear(self.state_dim, mixer_hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(mixer_hidden_dims[0], 1)
+        )
+    
+    def forward(self, agent_qs: torch.Tensor, states: torch.Tensor, agent_ids: list[int] | tuple[int, ...]):
+
+        #TODO: agent_qs.view(-1, agent dim)
+        #TODO: resize agent_qs agent dim to self.n_agents if needed, order using agent_id_to_idx
+        #agent_qs shape: (*batch size, seq length, num agents)
+        #states shape: (*batch size, seq length, state dim)
+        pass
 
 class QMIX():
     pass
@@ -477,3 +500,9 @@ if __name__ == '__main__':
     episode = Episode(state_history, obs_history, act_history, reward_history, next_state_history, next_obs_history, is_term_history, agent_id, pad_mask)
     #TODO: replace agent tensor param to agent_idx_to_id mapping
     print('parallel env done')
+    
+    x = QMixer(5, sum(agent_obs_dims.values()), (4, 8, 12), (4, 8))
+    y = QMixer(5, sum(agent_obs_dims.values()))
+    z = QMixer(5, sum(agent_obs_dims.values()), hypernet_hidden_dims=None)
+
+    print('test')
