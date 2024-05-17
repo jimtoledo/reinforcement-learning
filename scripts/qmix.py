@@ -45,7 +45,7 @@ def left_pad(length: int, *inputs: torch.Tensor, dim: int = 0, value=0):
     '''
     inputs = tuple(input.transpose(0, dim) for input in inputs) #swap with outermost dimension
     #pad outermost dimension, then swap dims back
-    outs = tuple(F.pad(input, 2*tuple(0 for _ in range(len(input.shape)-1)) + (length-input.shape[0], 0), value=value).transpose(0, dim) for input in inputs)
+    outs = tuple(F.pad(input, 2*tuple(0 for _ in range(input.ndim-1)) + (length-input.shape[0], 0), value=value).transpose(0, dim) for input in inputs)
     return outs if len(outs) > 1 else outs[0]
 
 def right_pad(length: int, *inputs: torch.Tensor, dim: int = 0, value=0):
@@ -54,7 +54,7 @@ def right_pad(length: int, *inputs: torch.Tensor, dim: int = 0, value=0):
     '''
     inputs = tuple(input.transpose(0, dim) for input in inputs) #swap with outermost dimension
     #pad outermost dimension, then swap dims back
-    outs = tuple(F.pad(input, 2*tuple(0 for _ in range(len(input.shape)-1)) + (0, length-input.shape[0]), value=value).transpose(0, dim) for input in inputs)
+    outs = tuple(F.pad(input, 2*tuple(0 for _ in range(input.ndim-1)) + (0, length-input.shape[0]), value=value).transpose(0, dim) for input in inputs)
     return outs if len(outs) > 1 else outs[0]
 
 #Deep Recurrent Q Network
@@ -216,7 +216,7 @@ class MultiAgentDRQN(nn.Module):
         else:
             nn_input = torch.cat([obs_history, agent_one_hot], dim=-1)
         
-        if len(nn_input.shape) == 4: nn_input = nn_input.transpose(0, 1) #swap batch and sequence dims if batch input
+        if nn_input.ndim == 4: nn_input = nn_input.transpose(0, 1) #swap batch and sequence dims if batch input
         if nn_input.device != self.device: nn_input = nn_input.to(self.device)
         return nn_input #Tensor shape: (seq length, *batch size, num agents, self.input_dim)
 
@@ -229,7 +229,7 @@ class MultiAgentDRQN(nn.Module):
         nn_input = nn_input.flatten(1, -2) #shape: (seq length, num agents, input size) | (seq length, batch size * num agents, input size)
         nn_output = self.rnn(nn_input)
         nn_output = nn_output.view(*input_shape, self.output_dim) #shape: (seq length, *batch size, num agents, output dim)
-        if len(nn_output.shape) == 4: nn_output = nn_output.transpose(0, 1) #swap batch and sequence dims if batch input
+        if nn_output.ndim == 4: nn_output = nn_output.transpose(0, 1) #swap batch and sequence dims if batch input
         #nn_output shape: (*batch size, seq length, num agents, output dim)
 
         #Calculate max values and actions for each agent
@@ -248,7 +248,6 @@ class MultiAgentDRQN(nn.Module):
     def select_action(self, obs_history: torch.Tensor, agent: int, action_history: torch.Tensor | None = None) -> torch.Tensor:
         #Tensor shapes: (*batch size, seq length, *) | (seq length, *)
         if obs_history.shape[-1] < self.obs_dim: #pad obs dim if needed
-            #obs_history = F.pad(obs_history, (0, self.obs_dim-obs_history.shape[-1]) + 2*tuple(0 for _ in range(len(obs_history.shape)-1)), value=0)
             obs_history = right_pad(self.obs_dim, obs_history, dim=-1)
         if self.last_action_input:
             #0-filled tensor at current t
@@ -265,7 +264,6 @@ class MultiAgentDRQN(nn.Module):
     def select_actions(self, obs_history: torch.Tensor, agent_ids: list[int] | tuple[int, ...], action_history: torch.Tensor | None = None) -> torch.Tensor:
         #Tensor shapes: (*batch size, seq length, num agents, *) | (seq length, num agents, *)
         if obs_history.shape[-1] < self.obs_dim: #pad obs dim if needed
-            #obs_history = F.pad(obs_history, (0, self.obs_dim-obs_history.shape[-1]) + 2*tuple(0 for _ in range(len(obs_history.shape)-1)), value=0)
             obs_history = right_pad(self.obs_dim, obs_history, dim=-1)
         if self.last_action_input:
             #0-filled tensor at current t
@@ -328,13 +326,13 @@ class QMixer(nn.Module):
             }))
         
         #Weights for final mixer layer->Q_total
-        self.mixer_final_weights = nn.Sequential(
+        mixer_final_weights = nn.Sequential(
             hypernet_init,
             nn.Linear(hypernet_hidden_dims[-1], mixer_hidden_dims[-1])
         ) if hypernet_init else nn.Linear(self.state_dim, mixer_hidden_dims[-1])
         
         #V(S) instead of bias for last layers
-        self.V_S = nn.Sequential(
+        V_s = nn.Sequential(
             hypernet_init,
             nn.Linear(hypernet_hidden_dims[-1], 1)
         ) if hypernet_init else nn.Sequential( #if no hypernet hidden dims, construct 2 layer hypernetwork using first mixer hidden dim
@@ -343,10 +341,16 @@ class QMixer(nn.Module):
             nn.Linear(mixer_hidden_dims[0], 1)
         )
 
+        self.mixer_layers.append(nn.ModuleDict({
+            'weights': mixer_final_weights,
+            'bias': V_s
+        }))
+
         self.device = torch.device("cpu") if not torch.cuda.is_available() else device
         self.to(self.device)
     
     def _format_agent_qs(self, agent_qs: torch.Tensor, agent_ids: list[int] | tuple[int, ...]):
+        if agent_qs.ndim == 1: agent_qs = agent_qs.unsqueeze(0)
         agent_qs = agent_qs.view(-1, agent_qs.shape[-1]) #reshape to 2D tensor
         
         #expand agent dim if necessary
@@ -367,20 +371,27 @@ class QMixer(nn.Module):
         return agent_qs.view(-1, 1, self.n_agents)
 
     def forward(self, agent_qs: torch.Tensor, states: torch.Tensor, agent_ids: list[int] | tuple[int, ...]):
+        #input shape: (*batch size, *seq length, num agents|state dim)
+        in_shape = agent_qs.shape[:-1]
         if agent_qs.device != self.device: agent_qs = agent_qs.to(self.device)
         if states.device != self.device: states = states.to(self.device)
+        if states.ndim == 1: states = states.unsqueeze(0)
+
         #NOTE: len(agent_ids) must match agent_qs.shape[-1]
-        agent_qs = self._format_agent_qs(agent_qs, agent_ids)
-        print('test')
+        x = self._format_agent_qs(agent_qs, agent_ids)
+        states = states.view(-1, self.state_dim) #2D tensor (seq length rolled into batch size)
+        batch_size = x.shape[0]
 
+        #pass through mixer network layers
+        for layer in self.mixer_layers:
+            w = torch.abs(layer['weights'](states)) #force non-negative weights for monotonic mixing
+            w = w.view(batch_size, x.shape[-1], -1) #batch weight matrix
+            b = layer['bias'](states).view(batch_size, 1, -1) #bias
+            x = torch.bmm(x, w) + b #apply linear layer
+            if layer != self.mixer_layers[-1]: x = F.elu(x) #ELU activation for hidden layers
         
-
-
-
-        #TODO: agent_qs.view(-1, agent dim)
-        #agent_qs shape: (*batch size, seq length, num agents)
-        #states shape: (*batch size, seq length, state dim)
-        pass
+        #Q_tot return shape: (*batch size, *seq length, 1)
+        return x.view(*in_shape, 1)
 
 class QMIX():
     pass
@@ -394,80 +405,80 @@ NOTE: input to multi-agent DQRNN should be episode batch of shape (N, L, X)
 '''
 
 if __name__ == '__main__':
-    # import time
-    # agent_obs_dims = {1: 3, 4: 2, 2: 1, 7: 1}
-    # agent_action_dims = {1: 3, 4: 2, 2: 1, 7: 1}
-    # rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
-    # rnn1 = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
+    import time
+    agent_obs_dims = {1: 3, 4: 2, 2: 1, 7: 1}
+    agent_action_dims = {1: 3, 4: 2, 2: 1, 7: 1}
+    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
+    rnn1 = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
 
-    # obs_history = torch.randn(5, 10, 4, 3)
+    obs_history = torch.randn(5, 10, 4, 3)
 
-    # agent = list(agent_obs_dims.keys())
+    agent = list(agent_obs_dims.keys())
 
-    # action_history = torch.randint(0, 3, (5, 10, 4, 1))
+    action_history = torch.randint(0, 3, (5, 10, 4, 1))
 
-    # before = time.time()
+    before = time.time()
 
-    # a = rnn(obs_history, agent, action_history)
+    a = rnn(obs_history, agent, action_history)
 
-    # b = rnn(obs_history[0], agent, action_history[0])
+    b = rnn(obs_history[0], agent, action_history[0])
 
-    # c = rnn1._build_input(obs_history, agent, action_history)
+    c = rnn1._build_input(obs_history, agent, action_history)
 
-    # d = rnn1._build_input(obs_history[0], agent, action_history[0])
+    d = rnn1._build_input(obs_history[0], agent, action_history[0])
 
-    # e = rnn1.select_action(obs_history[..., 1, :], 7, action_history[..., 1, :])
+    e = rnn1.select_action(obs_history[..., 1, :], 7, action_history[..., 1, :])
 
-    # f = rnn1.select_action(obs_history[0,..., 1, :], 7, action_history[0, ..., 1, :])
+    f = rnn1.select_action(obs_history[0,..., 1, :], 7, action_history[0, ..., 1, :])
 
-    # g = rnn(obs_history, agent, action_history)
-    # h = rnn(obs_history[0], (agent[0], ), action_history[0])
-    # optimizer = optim.RMSprop(rnn.parameters(), 1e-4)
-    # for _ in range(20):
-    #     g = rnn(obs_history, agent, action_history)
-    #     loss = nn.MSELoss()(g[1], torch.zeros(g[1].shape, device=g[1].device))
-    #     print(loss)
-    #     optimizer.zero_grad()
-    #     loss.backward()
-    #     optimizer.step()
-    # print(time.time() - before)
+    g = rnn(obs_history, agent, action_history)
+    h = rnn(obs_history[0], (agent[0], ), action_history[0])
+    optimizer = optim.RMSprop(rnn.parameters(), 1e-4)
+    for _ in range(20):
+        g = rnn(obs_history, agent, action_history)
+        loss = nn.MSELoss()(g[1], torch.zeros(g[1].shape, device=g[1].device))
+        print(loss)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    print(time.time() - before)
 
     from pettingzoo.mpe import simple_speaker_listener_v4, simple_spread_v3
-    # env = simple_speaker_listener_v4.env()
+    env = simple_speaker_listener_v4.env()
 
-    # agent_ids = {agent: id for id, agent in enumerate(env.possible_agents)}
-    # agent_obs_dims = {id: env.observation_space(agent).shape[0] for id, agent in enumerate(env.possible_agents)}
-    # agent_action_dims = {id: env.action_space(agent).n for id, agent in enumerate(env.possible_agents)}
-    # rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
-    # rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
+    agent_ids = {agent: id for id, agent in enumerate(env.possible_agents)}
+    agent_obs_dims = {id: env.observation_space(agent).shape[0] for id, agent in enumerate(env.possible_agents)}
+    agent_action_dims = {id: env.action_space(agent).n for id, agent in enumerate(env.possible_agents)}
+    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
+    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
 
-    # env.reset()
-    # obs_history = {}
-    # act_history = {}
-    # for agent in env.agent_iter():
-    #     state, reward, terminated, truncated, _ = env.last()
-    #     if agent in obs_history:
-    #         obs_history[agent] = torch.cat((obs_history[agent], torch.tensor(state, dtype=torch.float32).unsqueeze(0)))
-    #     else:
-    #         obs_history[agent] = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+    env.reset()
+    obs_history = {}
+    act_history = {}
+    for agent in env.agent_iter():
+        state, reward, terminated, truncated, _ = env.last()
+        if agent in obs_history:
+            obs_history[agent] = torch.cat((obs_history[agent], torch.tensor(state, dtype=torch.float32).unsqueeze(0)))
+        else:
+            obs_history[agent] = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
         
-    #     if terminated or truncated:
-    #         env.step(None)
-    #         if agent in act_history:
-    #             act_history[agent] = torch.cat((act_history[agent], torch.zeros(1, 1, dtype=torch.long)))
-    #         else:
-    #             act_history[agent] = torch.zeros(1, 1, dtype=torch.long)
+        if terminated or truncated:
+            env.step(None)
+            if agent in act_history:
+                act_history[agent] = torch.cat((act_history[agent], torch.zeros(1, 1, dtype=torch.long)))
+            else:
+                act_history[agent] = torch.zeros(1, 1, dtype=torch.long)
             
-    #     else:
-    #         action = rnn.select_action(obs_history[agent], agent_ids[agent], act_history[agent] if agent in act_history else None)
-    #         env.step(action.item())
+        else:
+            action = rnn.select_action(obs_history[agent], agent_ids[agent], act_history[agent] if agent in act_history else None)
+            env.step(action.item())
 
-    #         if agent in act_history:
-    #             act_history[agent] = torch.cat((act_history[agent], action.unsqueeze(0)))
-    #         else:
-    #             act_history[agent] = action.unsqueeze(0)
-    #             pass
-    # print('serial done')
+            if agent in act_history:
+                act_history[agent] = torch.cat((act_history[agent], action.unsqueeze(0)))
+            else:
+                act_history[agent] = action.unsqueeze(0)
+                pass
+    print('serial done')
 
     SEQ_LENGTH = 25
     env = simple_spread_v3.parallel_env(N=5, max_cycles=SEQ_LENGTH)
@@ -533,7 +544,6 @@ if __name__ == '__main__':
 
         #store stuff
     episode = Episode(state_history, obs_history, act_history, reward_history, next_state_history, next_obs_history, is_term_history, agent_id, pad_mask)
-    #TODO: replace agent tensor param to agent_idx_to_id mapping
     print('parallel env done')
     res = rnn(episode.obs, agent_ids_list, episode.actions)
     
@@ -541,7 +551,8 @@ if __name__ == '__main__':
     y = QMixer(agent_ids_list, sum(agent_obs_dims.values()))
     z = QMixer(agent_ids_list, sum(agent_obs_dims.values()), hypernet_hidden_dims=None)
     x(res[1][..., 1:4], episode.states, agent_ids_list[1:4])
-    y(res[1], episode.states.unsqueeze(0), agent_ids_list)
+    y(torch.cat((res[1].unsqueeze(0),res[1].unsqueeze(0))), torch.cat((episode.states.unsqueeze(0),episode.states.unsqueeze(0))), agent_ids_list)
     z(res[1], episode.states, agent_ids_list)
+    x(res[1][0], episode.states[0], agent_ids_list)
 
     print('test')
