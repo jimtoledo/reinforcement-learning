@@ -5,8 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torchrl.data import ReplayBuffer, LazyTensorStorage
 from tqdm import tqdm
 from collections.abc import Mapping
+from pettingzoo import AECEnv, ParallelEnv
 
 '''
 NOTE: if param sharing (generally if agents have the same observation and action space), include agent ID as part of observation (one-hot encoded)
@@ -56,6 +58,28 @@ def right_pad(length: int, *inputs: torch.Tensor, dim: int = 0, value=0):
     #pad outermost dimension, then swap dims back
     outs = tuple(F.pad(input, 2*tuple(0 for _ in range(input.ndim-1)) + (0, length-input.shape[0]), value=value).transpose(0, dim) for input in inputs)
     return outs if len(outs) > 1 else outs[0]
+
+
+class ExpDecaySchedule():
+    def __init__(self, init_epsilon=1.0, min_epsilon=0.1, decay_steps=20000):
+        self.epsilon = init_epsilon
+        self.init_epsilon = init_epsilon
+        self.decay_steps = decay_steps
+        self.min_epsilon = min_epsilon
+        self.epsilons = 0.01 / np.logspace(-2, 0, decay_steps, endpoint=False) - 0.01
+        self.epsilons = self.epsilons * (init_epsilon - min_epsilon) + min_epsilon
+        self.t = 0
+
+    def reset(self):
+        self.t = 0
+    
+    def get(self):
+        return self.epsilon
+    
+    def step(self):
+        self.t += 1
+        self.epsilon = self.min_epsilon if self.t >= self.decay_steps else self.epsilons[self.t]
+        return self.epsilon
 
 #Deep Recurrent Q Network
 class DRQN(nn.Module):
@@ -163,7 +187,7 @@ class MultiAgentDRQN(nn.Module):
                  fc1_hidden_dims: tuple[int, ...] = (), fc2_hidden_dims: tuple[int, ...] = (), rnn_dims: tuple[int, int] = (64, 64), 
                  activation_fc = nn.ReLU, device=torch.device("cuda")):
         super(MultiAgentDRQN, self).__init__()
-
+        #TODO: agent_ids from int to string
         self.agent_obs_dims = agent_obs_dims #map agent id -> observation space dim
         self.agent_action_dims = agent_action_dims #map agent id -> # available actions
         self.last_action_input = last_action_input
@@ -393,16 +417,90 @@ class QMixer(nn.Module):
         #Q_tot return shape: (*batch size, *seq length, 1)
         return x.view(*in_shape, 1)
 
-class QMIX():
-    pass
+class QMIXLearner():
+    def __init__(self, 
+            MultiAgentDQN_fn = lambda agent_obs_dims, agent_action_dims: MultiAgentDRQN(agent_obs_dims, agent_action_dims),
+            Qmixer_fn = lambda agent_ids, state_shape: QMixer(agent_ids, state_shape),
+            optimizer_fn = lambda params, lr : optim.RMSprop(params, lr), #model params, lr -> optimizer
+            optimizer_lr = 1e-4, #optimizer learning rate
+            loss_fn = nn.MSELoss(), #input, target -> loss
+            epsilon_schedule = ExpDecaySchedule(), #module with step, get, and reset
+            replay_buffer = ReplayBuffer(storage=LazyTensorStorage(max_size=500, device=torch.device("cuda"))),
+            max_gradient_norm = None):
+        self.MultiAgentDQN_fn = MultiAgentDQN_fn
+        self.Qmixer_fn = Qmixer_fn
+        self.optimizer_fn = optimizer_fn
+        self.optimizer_lr = optimizer_lr
+        self.loss_fn = loss_fn
+        self.epsilon_schedule = epsilon_schedule
+        self.memory = replay_buffer
+        self.max_gradient_norm = max_gradient_norm
 
-'''
-NOTE: input to multi-agent DQRNN should be episode batch of shape (N, L, X)
-    N = batch size
-    L = length of longest sequence (shorter sequences should be zero-padded at the beginning?)
-        process episode batch from L=t+1=1 to L=t_max+1, where t_max is the max timestep of the longest episode in batch
-    X = flattened feature vector (agent obs, agent last action, agent identifier)
-'''
+    def _init_model(self, env: AECEnv | ParallelEnv):
+        self.agent_ids = {agent: id for id, agent in enumerate(env.possible_agents)}
+        self.agent_obs_dims = {id: int(np.prod(env.observation_space(agent).shape)) for id, agent in enumerate(env.possible_agents)}
+        self.agent_action_dims = {id: env.action_space(agent).n for id, agent in enumerate(env.possible_agents)}
+        #rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
+        self.agent_state_idxs = {}
+        idx = 0
+        for agent in env.possible_agents:
+            obs_length = env.observation_space(agent).shape[0]
+            self.agent_state_idxs[agent] = slice(idx, idx+obs_length)
+            idx += obs_length
+        #y = QMixer(agent_ids_list, sum(agent_obs_dims.values()))
+            
+        #initialize online and target models/mixers
+        self.online_model = MultiAgentDRQN(self.agent_obs_dims, self.agent_action_dims)
+        self.target_model = MultiAgentDRQN(self.agent_obs_dims, self.agent_action_dims)
+        self.target_model.load_state_dict(self.online_model.state_dict())
+
+        self.online_mixer = QMixer(list(self.agent_ids.values()), sum(self.agent_obs_dims.values()))
+        self.target_mixer = QMixer(list(self.agent_ids.values()), sum(self.agent_obs_dims.values()))
+        self.target_mixer.load_state_dict(self.online_mixer)
+
+        #initialize optimizer
+        self.optimizer = self.optimizer_fn(list(self.online_model.parameters()) + list(self.online_mixer.parameters()), lr=self.optimizer_lr)
+    
+    def _update_target(self, tau):
+        for target, online in zip(self.target_model.parameters(), self.online_model.parameters()):
+            target_weights = tau*online.data + (1-tau)*target.data
+            target.data.copy_(target_weights)
+        
+        for target, online in zip(self.target_mixer.parameters(), self.online_mixer.parameters()):
+            target_weights = tau*online.data + (1-tau)*target.data
+            target.data.copy_(target_weights)
+
+    def _optimize_model(self):
+        pass
+
+    def evaluate(self, env: AECEnv | ParallelEnv, gamma: float = 1.0, seq_length: int | None = None, seed: int | None = None) -> float:
+        ep_return = {agent: 0 for agent in env.possible_agents}
+        if seq_length:
+            obs_history = torch.zeros(seq_length, self.online_model.n_agents, self.online_model.obs_dim, dtype=torch.float32) #L = max(obs space length) 
+            act_history = torch.zeros(seq_length, self.online_model.n_agents, 1, dtype=torch.long) #L = 1
+        else:
+            obs_history = {agent: [] for agent in env.possible_agents}
+            act_history = {agent: [] for agent in env.possible_agents}
+        
+        if issubclass(type(env), AECEnv):
+            pass
+        else:
+            state = env.reset()[0]
+            for t in count():
+                if not env.agents or (seq_length and t >= seq_length): break
+                actions = {} #agent: action dict to pass to env.step function
+                for agent in env.agents:
+                    #store agent obs at time t
+                    obs = torch.tensor(state[agent])
+                    idx = rnn.agent_id_to_idx[agent_ids[agent]]
+                    obs_history[t, idx] = right_pad(rnn.obs_dim, obs) #individual obs history
+                    
+                    action = rnn.select_action(obs_history[:t+1, idx], agent_ids[agent], act_history[:t+1, idx])
+                    act_history[t, idx] = action #store agent action at time t
+                    actions[agent] = action.item()
+
+                state, reward, terminated, truncated, _ = env.step(actions)
+
 
 if __name__ == '__main__':
     import time
@@ -554,5 +652,17 @@ if __name__ == '__main__':
     y(torch.cat((res[1].unsqueeze(0),res[1].unsqueeze(0))), torch.cat((episode.states.unsqueeze(0),episode.states.unsqueeze(0))), agent_ids_list)
     z(res[1], episode.states, agent_ids_list)
     x(res[1][0], episode.states[0], agent_ids_list)
+
+    optimizer = optim.RMSprop(x.parameters(), 1e-4)
+    for _ in range(20):
+        res = rnn(episode.obs, agent_ids_list, episode.actions)
+        g = x(torch.cat((res[1].unsqueeze(0),res[1].unsqueeze(0))), torch.cat((episode.states.unsqueeze(0),episode.states.unsqueeze(0))), agent_ids_list)
+        loss = nn.MSELoss()(g, torch.zeros(g.shape, device=g.device))
+        print(loss)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    print(time.time() - before)
+    #TODO: parameter (epsilon/alpha, etc.) schedule instead of 'exploration_strategy'
 
     print('test')
