@@ -436,6 +436,7 @@ class QMIXLearner():
         self.max_gradient_norm = max_gradient_norm
 
     def _init_model(self, env: AECEnv | ParallelEnv):
+        self.n_agents = len(env.possible_agents)
         self.agent_idxs = {agent: idx for idx, agent in enumerate(env.possible_agents)}
         self.agent_obs_dims = {agent: int(np.prod(env.observation_space(agent).shape)) for agent in env.possible_agents}
         self.agent_action_dims = {agent: env.action_space(agent).n for agent in env.possible_agents}
@@ -470,26 +471,64 @@ class QMIXLearner():
     def _optimize_model(self):
         pass
 
-    def evaluate(self, env: AECEnv | ParallelEnv, gamma: float = 1.0, seq_length: int | None = None, seed: int | None = None) -> float:
+    def _select_action(self, env: AECEnv | ParallelEnv, obs_hist: torch.Tensor, agent: str, act_hist: torch.Tensor | None, explore: bool = True) -> torch.Tensor:
+        if explore and self.epsilon_schedule.get() > np.random.rand():
+            action = torch.tensor(env.action_space(agent).sample()).unsqueeze(0)
+        else:
+            action = self.online_model.select_action(obs_hist, agent, act_hist)
+        return action
+
+    def evaluate(self, env: AECEnv | ParallelEnv, gamma: float = 1.0, max_length: int | None = None, seed: int | None = None) -> float:
         ep_return = {agent: 0 for agent in env.possible_agents}
-        if seq_length:
-            obs_history = {agent: torch.zeros(seq_length, self.online_model.obs_dim, dtype=torch.float32) for agent in env.possible_agents}
-            act_history = {agent: torch.zeros(seq_length, 1, dtype=torch.long) for agent in env.possible_agents}
+        rnn = self.online_model
+        if max_length:
+            obs_history = {agent: torch.zeros(max_length, rnn.obs_dim, dtype=torch.float32) for agent in env.possible_agents}
+            act_history = {agent: torch.zeros(max_length, 1, dtype=torch.long) for agent in env.possible_agents}
         else:
             obs_history = {agent: [] for agent in env.possible_agents}
             act_history = {agent: [] for agent in env.possible_agents}
         
         if issubclass(type(env), AECEnv):
-            pass
+            env.reset(seed=seed)
+            agent_t = {agent: 0 for agent in env.possible_agents}
+            for agent in env.agent_iter():
+                t = agent_t[agent]
+                obs, reward, terminated, truncated, _ = env.last()
+
+                ep_return[agent] += reward*gamma**t
+                if max_length and t >= max_length: break
+
+                obs = right_pad(rnn.obs_dim, torch.tensor(obs))
+                if max_length:
+                    obs_history[agent][t] = obs
+                    curr_obs_hist = obs_history[agent][:t+1]
+                    curr_act_hist = act_history[agent][:t+1]
+                else:
+                    obs_history[agent].append(obs)
+                    act_history[agent].append(torch.zeros(1, dtype=torch.long))
+                    curr_obs_hist = torch.stack(obs_history[agent])
+                    curr_act_hist = torch.stack(act_history[agent])
+                
+                if terminated or truncated:
+                    env.step(None)
+                else:
+                    action = rnn.select_action(curr_obs_hist, agent, curr_act_hist)
+                    env.step(action.item())
+                    if max_length:
+                        act_history[agent][t] = action
+                    else:
+                        act_history[agent][-1] = action.cpu()
+                
+                agent_t[agent] += 1
         else:
-            state = env.reset()[0]
+            state = env.reset(seed=seed)[0]
             for t in count():
-                if not env.agents or (seq_length and t >= seq_length): break
+                if not env.agents or (max_length and t >= max_length): break
                 actions = {} #agent: action dict to pass to env.step function
                 for agent in env.agents:
                     #store agent obs at time t
                     obs = right_pad(rnn.obs_dim, torch.tensor(state[agent]))
-                    if seq_length:
+                    if max_length:
                         obs_history[agent][t] = obs
                         curr_obs_hist = obs_history[agent][:t+1]
                         curr_act_hist = act_history[agent][:t+1]
@@ -501,7 +540,7 @@ class QMIXLearner():
                     
                     action = rnn.select_action(curr_obs_hist, agent, curr_act_hist)
 
-                    if seq_length:
+                    if max_length:
                         act_history[agent][t] = action
                     else:
                         act_history[agent][-1] = action.cpu()
@@ -510,9 +549,109 @@ class QMIXLearner():
                 state, reward, _, _, _ = env.step(actions)
 
                 for agent, r in reward.items():
-                    ep_return[agent] += r
+                    ep_return[agent] += r*gamma**t
 
         return ep_return
+    
+    def train(self, env: AECEnv | ParallelEnv, gamma: float = 1.0, num_episodes: int = 5000, max_episode_length: int = 500, 
+              batch_size: int = 32, n_warmup_batches: int = 1, online_update_steps: int = 1, tau: float = 0.005, target_update_steps: int = 1, 
+              save_models: list[int] | None = None, seeds: list[int] = [], evaluate: bool = True):
+        
+        if save_models: #list of episodes to save models
+                save_models.sort()
+        self.gamma = gamma
+        self.batch_size = batch_size
+        self._init_model(env)
+
+        saved_models = {}
+        best_model = None
+        episode_returns = {agent: [] for agent in env.possible_agents}
+
+        rnn = self.online_model
+        state_history = torch.zeros(max_episode_length, sum(self.agent_obs_dims.values()))
+        obs_history = torch.zeros(max_episode_length, rnn.n_agents, rnn.obs_dim, dtype=torch.float32) #L = max(obs space length) 
+        act_history = torch.zeros(max_episode_length, rnn.n_agents, 1, dtype=torch.long) #L = 1
+        reward_history = torch.zeros(max_episode_length, rnn.n_agents, 1, dtype=torch.float32) #L = 1
+        next_state_history = torch.zeros(max_episode_length, sum(self.agent_obs_dims.values()))
+        next_obs_history = torch.zeros(max_episode_length, rnn.n_agents, rnn.obs_dim, dtype=torch.float32) # L = max(obs space length) 
+        is_term_history = torch.zeros(max_episode_length, rnn.n_agents, 1, dtype=torch.bool) #L = 1
+
+        pad_mask = torch.ones(max_episode_length, rnn.n_agents, 1, dtype=torch.bool) #L = 1, pad=1 by default, set to 0 within episode loop
+        agent_id = torch.zeros_like(act_history) #L = 1
+        for idx in self.agent_idxs.values():
+            agent_id[:, idx, 0] = idx
+        
+        
+        for episode in tqdm(range(num_episodes)):
+            seed = np.random.choice(seeds).item() if len(seeds) else None
+            state = env.reset(seed=seed)
+
+            if issubclass(type(env), AECEnv):
+                obs = None
+                agent_t = {agent: 0 for agent in env.possible_agents}
+                for agent in env.agent_iter():
+                    t = agent_t[agent]
+
+                    obs, reward, terminated, truncated, _ = env.last()
+                    obs = torch.tensor(obs)
+                    idx = self.agent_idxs[agent]
+                    
+                    #store results of action taken from previous timestep
+                    if t > 0:
+                        next_state_history[t-1, self.agent_state_idxs[agent]] = obs
+                        next_obs_history[t-1, idx] = right_pad(rnn.obs_dim, obs)
+                        reward_history[t-1, idx, 0] = reward
+                        is_term_history[t-1, idx, 0] = terminated
+                        pad_mask[t-1, idx, 0] = False
+
+                    if t >= max_episode_length: break
+                    if terminated or truncated:
+                        env.step(None)
+                    else:
+                        #store agent obs at time t
+                        state_history[t, self.agent_state_idxs[agent]] = obs #shared state history
+                        obs_history[t, idx] = right_pad(rnn.obs_dim, obs) #individual obs history
+                        #get and store action taken at time t
+                        action = self._select_action(env, obs_history[:t+1, idx], agent, act_history[:t+1, idx])
+                        act_history[t, idx] = action
+                        env.step(action.item())
+                    
+                    if max(agent_t.values()) < t+1: self.epsilon_schedule.step()
+                    agent_t[agent] += 1
+
+            else:
+                state = state[0]
+                for t in count():
+                    if not env.agents or t>=max_episode_length: break
+                    actions = {} #agent: action dict to pass to env.step function
+                    for agent in env.agents:
+                        #store agent obs at time t
+                        obs = torch.tensor(state[agent])
+                        state_history[t, self.agent_state_idxs[agent]] = obs #shared state history
+                        idx = self.agent_idxs[agent]
+                        obs_history[t, idx] = right_pad(rnn.obs_dim, obs) #individual obs history
+                        
+                        action = self._select_action(env, obs_history[:t+1, idx], agent, act_history[:t+1, idx])
+                        act_history[t, idx] = action #store agent action at time t
+                        actions[agent] = action.item()
+
+                    state, reward, terminated, truncated, _ = env.step(actions)
+
+                    for agent in env.agents:
+                        #store agent next obs at time t
+                        obs = torch.tensor(state[agent])
+                        next_state_history[t, self.agent_state_idxs[agent]] = obs
+                        idx = rnn.agent_id_to_idx[agent]
+                        next_obs_history[t, idx] = right_pad(rnn.obs_dim, obs) #individual obs history
+
+                        reward_history[t, idx, 0] = reward[agent]
+                        is_term_history[t, idx, 0] = terminated[agent]
+                        pad_mask[t, idx, 0] = False
+                    
+                    self.epsilon_schedule.step()
+
+                #store stuff
+            episode = Episode(state_history, obs_history, act_history, reward_history, next_state_history, next_obs_history, is_term_history, agent_id, pad_mask)
 
 
 if __name__ == '__main__':
@@ -555,43 +694,10 @@ if __name__ == '__main__':
     # print(time.time() - before)
 
     from pettingzoo.mpe import simple_speaker_listener_v4, simple_spread_v3
-    env = simple_speaker_listener_v4.env()
-
-    agent_obs_dims = {agent: env.observation_space(agent).shape[0] for agent in env.possible_agents}
-    agent_action_dims = {agent: env.action_space(agent).n for agent in env.possible_agents}
-    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
-    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
-
-    env.reset()
-    obs_history = {}
-    act_history = {}
-    for agent in env.agent_iter():
-        state, reward, terminated, truncated, _ = env.last()
-        if agent in obs_history:
-            obs_history[agent] = torch.cat((obs_history[agent], torch.tensor(state, dtype=torch.float32).unsqueeze(0)))
-        else:
-            obs_history[agent] = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-        
-        if terminated or truncated:
-            env.step(None)
-            if agent in act_history:
-                act_history[agent] = torch.cat((act_history[agent], torch.zeros(1, 1, dtype=torch.long)))
-            else:
-                act_history[agent] = torch.zeros(1, 1, dtype=torch.long)
-            
-        else:
-            action = rnn.select_action(obs_history[agent], agent, act_history[agent] if agent in act_history else None)
-            env.step(action.item())
-
-            if agent in act_history:
-                act_history[agent] = torch.cat((act_history[agent], action.unsqueeze(0)))
-            else:
-                act_history[agent] = action.unsqueeze(0)
-                pass
-    print('serial done')
 
     SEQ_LENGTH = 25
     env = simple_spread_v3.parallel_env(N=5, max_cycles=SEQ_LENGTH)
+    aec_env = simple_spread_v3.env(N=5, max_cycles=SEQ_LENGTH)
 
     agent_idxs = {agent: idx for idx, agent in enumerate(env.possible_agents)}
     agent_ids_list = list(agent_idxs.keys())
@@ -681,5 +787,9 @@ if __name__ == '__main__':
     learner = QMIXLearner(MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True))
     learner._init_model(env)
     r = learner.evaluate(env)
-    r1 = learner.evaluate(env, seq_length=SEQ_LENGTH)
+    r1 = learner.evaluate(env, max_length=20)
+    r2 = learner.evaluate(aec_env)
+    r2 = learner.evaluate(aec_env, max_length=20)
+    learner.train(env, num_episodes=20, max_episode_length=SEQ_LENGTH)
+    learner.train(aec_env, num_episodes=20, max_episode_length=SEQ_LENGTH)
     print('done')
