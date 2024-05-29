@@ -243,7 +243,6 @@ class DRQNLearner():
         saved_models = {}
         best_model = None
 
-        i = 0
         episode_returns = np.full(num_episodes, np.NINF)
         for episode in tqdm(range(num_episodes)):
             seed = np.random.choice(seeds).item() if len(seeds) else None
@@ -252,7 +251,6 @@ class DRQNLearner():
             ep_return = 0
             sequence = []
             for t in range(max_episode_length):
-                i += 1
                 action = self.exploration_strategy.select_action(self.online_model, obs_history, env.action_space.n) #use online model to select action
                 next_state, reward, terminated, truncated, _ = env.step(action)
 
@@ -285,11 +283,11 @@ class DRQNLearner():
             #add to episode buffer
             self.memory.add(Episode(states, actions, rewards, next_states, is_terminals, pad_masks))
 
-            if i % online_update_steps == 0 and len(self.memory) >= batch_size*n_warmup_batches: #optimize online model
+            if (episode+1) % online_update_steps == 0 and len(self.memory) >= batch_size*n_warmup_batches: #optimize online model
                 self._optimize_model()
 
             #update target network with tau
-            if i % target_update_steps == 0:
+            if (episode+1) % target_update_steps == 0:
                 #self.target_model.load_state_dict(self.online_model.state_dict())
                 for target, online in zip(self.target_model.parameters(), self.online_model.parameters()):
                     target_weights = tau*online.data + (1-tau)*target.data
