@@ -225,6 +225,8 @@ class MultiAgentDRQN(nn.Module):
 
         
         if self.last_action_input:
+            if action_history.shape[-3] < obs_history.shape[-3]:
+                action_history = right_pad(obs_history.shape[-3], action_history, dim=-3)
             #Construct last action one-hot tensor: (*batch size, seq length, num agents, max(num available actions))
             last_action_one_hot = torch.empty(action_history.shape, device=action_history.device) #shape: (*batch size, seq length, num agents, 1)
             last_action_one_hot = F.one_hot(action_history, self.output_dim).squeeze(-2) #shape: (*batch size, seq length, num agents, max(num available actions))
@@ -276,9 +278,6 @@ class MultiAgentDRQN(nn.Module):
             #0-filled tensor at current t
             if action_history is None or not len(action_history):
                 action_history = torch.zeros(obs_history.shape[:-1], dtype=torch.long, device=obs_history.device).unsqueeze(-1)
-            elif action_history.shape[-2] < obs_history.shape[-2]:
-                action_history = right_pad(obs_history.shape[-2], action_history, dim=-2)
-            
             action_history = action_history.unsqueeze(-2) #add 'num agents' dim of size 1 
         obs_history = obs_history.unsqueeze(-2) #add 'num agents' dim of size 1 
         #return action to take at current t (shape: (*batch size, 1))
@@ -292,8 +291,7 @@ class MultiAgentDRQN(nn.Module):
             #0-filled tensor at current t
             if action_history is None or not len(action_history):
                 action_history = torch.zeros(obs_history.shape[:-1], dtype=torch.long, device=obs_history.device).unsqueeze(-1)
-            elif action_history.shape[-3] < obs_history.shape[-3]:
-                action_history = right_pad(obs_history.shape[-3], action_history, dim=-3)
+                
         #return action to take at current t (shape: (*batch size, num agents))
         return self(obs_history, agent_ids, action_history)[2].detach().cpu()[..., -1, :]
 
@@ -436,29 +434,34 @@ class QMIXLearner():
         self.max_gradient_norm = max_gradient_norm
 
     def _init_model(self, env: AECEnv | ParallelEnv):
-        self.n_agents = len(env.possible_agents)
-        self.agent_idxs = {agent: idx for idx, agent in enumerate(env.possible_agents)}
-        self.agent_obs_dims = {agent: int(np.prod(env.observation_space(agent).shape)) for agent in env.possible_agents}
-        self.agent_action_dims = {agent: env.action_space(agent).n for agent in env.possible_agents}
+        self.agents = env.possible_agents
+        self.agent_idxs = {agent: idx for idx, agent in enumerate(self.agents)}
+        self.agent_obs_dims = {agent: int(np.prod(env.observation_space(agent).shape)) for agent in self.agents}
+        self.agent_action_dims = {agent: env.action_space(agent).n for agent in self.agents}
         self.agent_state_idxs = {}
         idx = 0
-        for agent in env.possible_agents:
+        for agent in self.agents:
             obs_length = env.observation_space(agent).shape[0]
             self.agent_state_idxs[agent] = slice(idx, idx+obs_length)
             idx += obs_length
             
         #initialize online and target models/mixers
-        self.online_model = MultiAgentDRQN(self.agent_obs_dims, self.agent_action_dims)
-        self.target_model = MultiAgentDRQN(self.agent_obs_dims, self.agent_action_dims)
+        self.online_model = self.MultiAgentDQN_fn(self.agent_obs_dims, self.agent_action_dims)
+        self.target_model = self.MultiAgentDQN_fn(self.agent_obs_dims, self.agent_action_dims)
         self.target_model.load_state_dict(self.online_model.state_dict())
 
-        self.online_mixer = QMixer(env.possible_agents, sum(self.agent_obs_dims.values()))
-        self.target_mixer = QMixer(env.possible_agents, sum(self.agent_obs_dims.values()))
+        self.online_mixer = self.Qmixer_fn(self.agents, sum(self.agent_obs_dims.values()))
+        self.target_mixer = self.Qmixer_fn(self.agents, sum(self.agent_obs_dims.values()))
         self.target_mixer.load_state_dict(self.online_mixer.state_dict())
 
         #initialize optimizer
         self.optimizer = self.optimizer_fn(list(self.online_model.parameters()) + list(self.online_mixer.parameters()), lr=self.optimizer_lr)
     
+    def _copy_model(self):
+        copy = self.MultiAgentDQN_fn(self.agent_obs_dims, self.agent_action_dims)
+        copy.load_state_dict(self.online_model.state_dict())
+        return copy
+
     def _update_target(self, tau):
         for target, online in zip(self.target_model.parameters(), self.online_model.parameters()):
             target_weights = tau*online.data + (1-tau)*target.data
@@ -469,7 +472,34 @@ class QMIXLearner():
             target.data.copy_(target_weights)
 
     def _optimize_model(self):
-        pass
+        batch = self.memory.sample(self.batch_size)
+        #remove agent dims
+        rewards = batch.rewards[:, :, 0]
+        is_terminals = batch.is_terminals.any(dim=-2).long()
+        pad = batch.pad_masks.any(dim=-2).long()
+
+        #get predicted Q value with online network/mixer
+        agent_qs = self.online_model(batch.obs, self.agents, batch.actions)[1]
+        qs = self.online_mixer(agent_qs, batch.states, self.agents)
+
+        #get target Q values
+        with torch.no_grad():
+            #select best action of next state according to online model (double q learning)
+            next_actions = self.online_model(batch.next_obs, self.agents, batch.actions[:, 1:])[2].unsqueeze(-1) #shift action history left for next_actions input
+            #get values of next states using target network/mixer
+            next_agent_qs = self.target_model(batch.next_obs, self.agents, batch.actions[:, 1:])[0].gather(dim=-1, index=next_actions).squeeze()
+            next_qs = self.target_mixer(next_agent_qs, batch.next_states, self.agents).detach()
+        target_qs = rewards + (self.gamma * next_qs * (1 - is_terminals))
+
+        #don't include pad entries in loss calculation
+        loss = self.loss_fn((1 - pad) * qs, (1 - pad) * target_qs) #calculate loss between prediction and target
+
+        #optimize step (gradient descent)
+        self.optimizer.zero_grad()
+        loss.backward()
+        if self.max_gradient_norm:
+            torch.nn.utils.clip_grad_norm_(self.online_model.parameters(), self.max_gradient_norm)
+        self.optimizer.step()
 
     def _select_action(self, env: AECEnv | ParallelEnv, obs_hist: torch.Tensor, agent: str, act_hist: torch.Tensor | None, explore: bool = True) -> torch.Tensor:
         if explore and self.epsilon_schedule.get() > np.random.rand():
@@ -478,7 +508,7 @@ class QMIXLearner():
             action = self.online_model.select_action(obs_hist, agent, act_hist)
         return action
 
-    def evaluate(self, env: AECEnv | ParallelEnv, gamma: float = 1.0, max_length: int | None = None, seed: int | None = None) -> float:
+    def evaluate(self, env: AECEnv | ParallelEnv, gamma: float = 1.0, max_length: int | None = None, seed: int | None = None) -> dict[str, float]:
         ep_return = {agent: 0 for agent in env.possible_agents}
         rnn = self.online_model
         if max_length:
@@ -565,7 +595,7 @@ class QMIXLearner():
 
         saved_models = {}
         best_model = None
-        episode_returns = {agent: [] for agent in env.possible_agents}
+        episode_returns = {agent: [] for agent in self.agents}
 
         rnn = self.online_model
         state_history = torch.zeros(max_episode_length, sum(self.agent_obs_dims.values()))
@@ -585,28 +615,31 @@ class QMIXLearner():
         for episode in tqdm(range(num_episodes)):
             seed = np.random.choice(seeds).item() if len(seeds) else None
             state = env.reset(seed=seed)
+            for agent in self.agents: episode_returns[agent].append(0)
 
             if issubclass(type(env), AECEnv):
                 obs = None
-                agent_t = {agent: 0 for agent in env.possible_agents}
+                agent_t = {agent: 0 for agent in self.agents}
                 for agent in env.agent_iter():
                     t = agent_t[agent]
 
                     obs, reward, terminated, truncated, _ = env.last()
+                    episode_returns[agent][-1] += reward*gamma**t
                     obs = torch.tensor(obs)
                     idx = self.agent_idxs[agent]
                     
                     #store results of action taken from previous timestep
-                    if t > 0:
+                    if t > 0 and t <= max_episode_length:
                         next_state_history[t-1, self.agent_state_idxs[agent]] = obs
                         next_obs_history[t-1, idx] = right_pad(rnn.obs_dim, obs)
                         reward_history[t-1, idx, 0] = reward
                         is_term_history[t-1, idx, 0] = terminated
                         pad_mask[t-1, idx, 0] = False
 
-                    if t >= max_episode_length: break
                     if terminated or truncated:
                         env.step(None)
+                    elif t >= max_episode_length:
+                        env.step(env.action_space(agent).sample())
                     else:
                         #store agent obs at time t
                         state_history[t, self.agent_state_idxs[agent]] = obs #shared state history
@@ -615,7 +648,8 @@ class QMIXLearner():
                         action = self._select_action(env, obs_history[:t+1, idx], agent, act_history[:t+1, idx])
                         act_history[t, idx] = action
                         env.step(action.item())
-                    
+
+                    if min(agent_t.values()) > max_episode_length: break
                     if max(agent_t.values()) < t+1: self.epsilon_schedule.step()
                     agent_t[agent] += 1
 
@@ -634,6 +668,7 @@ class QMIXLearner():
                         action = self._select_action(env, obs_history[:t+1, idx], agent, act_history[:t+1, idx])
                         act_history[t, idx] = action #store agent action at time t
                         actions[agent] = action.item()
+                        pad_mask[t, idx, 0] = False
 
                     state, reward, terminated, truncated, _ = env.step(actions)
 
@@ -646,12 +681,36 @@ class QMIXLearner():
 
                         reward_history[t, idx, 0] = reward[agent]
                         is_term_history[t, idx, 0] = terminated[agent]
-                        pad_mask[t, idx, 0] = False
+                        episode_returns[agent][-1] += reward[agent]*gamma**t
                     
                     self.epsilon_schedule.step()
 
-                #store stuff
-            episode = Episode(state_history, obs_history, act_history, reward_history, next_state_history, next_obs_history, is_term_history, agent_id, pad_mask)
+            #store episode data to memory
+            self.memory.add(Episode(state_history, obs_history, act_history, reward_history, next_state_history, next_obs_history, is_term_history, agent_id, pad_mask))
+
+            if evaluate: 
+                ep_return = self.evaluate(env, gamma, seed)
+                for agent, r in ep_return.items():
+                    episode_returns[agent][-1] = r
+            if episode_returns[agent][-1] >= np.max(episode_returns[agent]): #save best model
+                best_model = self._copy_model()
+            #copy and save models
+            if save_models and len(saved_models) < len(save_models) and episode+1 == save_models[len(saved_models)]:
+                saved_models[episode+1] = self._copy_model()
+
+            if (episode+1) % online_update_steps == 0 and len(self.memory) >= batch_size*n_warmup_batches: #optimize online model
+                self._optimize_model()
+
+            #update targets with tau
+            if (episode+1) % target_update_steps == 0 and len(self.memory) >= batch_size*n_warmup_batches:
+                for target, online in zip(self.target_model.parameters(), self.online_model.parameters()):
+                    target_weights = tau*online.data + (1-tau)*target.data
+                    target.data.copy_(target_weights)
+                for target, online in zip(self.target_mixer.parameters(), self.online_mixer.parameters()):
+                    target_weights = tau*online.data + (1-tau)*target.data
+                    target.data.copy_(target_weights)
+        
+        return episode_returns, self.online_model, best_model, saved_models
 
 
 if __name__ == '__main__':
@@ -696,8 +755,8 @@ if __name__ == '__main__':
     from pettingzoo.mpe import simple_speaker_listener_v4, simple_spread_v3
 
     SEQ_LENGTH = 25
-    env = simple_spread_v3.parallel_env(N=5, max_cycles=SEQ_LENGTH)
-    aec_env = simple_spread_v3.env(N=5, max_cycles=SEQ_LENGTH)
+    env = simple_speaker_listener_v4.parallel_env(max_cycles=SEQ_LENGTH)
+    aec_env = simple_speaker_listener_v4.env(max_cycles=SEQ_LENGTH)
 
     agent_idxs = {agent: idx for idx, agent in enumerate(env.possible_agents)}
     agent_ids_list = list(agent_idxs.keys())
@@ -784,12 +843,8 @@ if __name__ == '__main__':
 
     print('test')
 
-    learner = QMIXLearner(MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True))
+    learner = QMIXLearner(lambda agent_obs_dims, agent_action_dims: MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True))
     learner._init_model(env)
-    r = learner.evaluate(env)
-    r1 = learner.evaluate(env, max_length=20)
-    r2 = learner.evaluate(aec_env)
-    r2 = learner.evaluate(aec_env, max_length=20)
-    learner.train(env, num_episodes=20, max_episode_length=SEQ_LENGTH)
-    learner.train(aec_env, num_episodes=20, max_episode_length=SEQ_LENGTH)
+    #learner.train(env, num_episodes=50, max_episode_length=20, evaluate=True)
+    x = learner.train(env, num_episodes=50, max_episode_length=SEQ_LENGTH, evaluate=False)
     print('done')
