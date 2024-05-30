@@ -714,137 +714,36 @@ class QMIXLearner():
 
 
 if __name__ == '__main__':
-    # import time
-    # agent_obs_dims = {'1': 3, '4': 2, '2': 1, '7': 1}
-    # agent_action_dims = {'1': 3, '4': 2, '2': 1, '7': 1}
-    # rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
-    # rnn1 = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=False)
-
-    # obs_history = torch.randn(5, 10, 4, 3)
-
-    # agent = list(agent_obs_dims.keys())
-
-    # action_history = torch.randint(0, 3, (5, 10, 4, 1))
-
-    # before = time.time()
-
-    # a = rnn(obs_history, agent, action_history)
-
-    # b = rnn(obs_history[0], agent, action_history[0])
-
-    # c = rnn1._build_input(obs_history, agent, action_history)
-
-    # d = rnn1._build_input(obs_history[0], agent, action_history[0])
-
-    # e = rnn1.select_action(obs_history[..., 1, :], '7', action_history[..., 1, :])
-
-    # f = rnn1.select_action(obs_history[0,..., 1, :], '7', action_history[0, ..., 1, :])
-
-    # g = rnn(obs_history, agent, action_history)
-    # h = rnn(obs_history[0], (agent[0], ), action_history[0])
-    # optimizer = optim.RMSprop(rnn.parameters(), 1e-4)
-    # for _ in range(20):
-    #     g = rnn(obs_history, agent, action_history)
-    #     loss = nn.MSELoss()(g[1], torch.zeros(g[1].shape, device=g[1].device))
-    #     print(loss)
-    #     optimizer.zero_grad()
-    #     loss.backward()
-    #     optimizer.step()
-    # print(time.time() - before)
-
-    from pettingzoo.mpe import simple_speaker_listener_v4, simple_spread_v3
+    import time
+    from pettingzoo.mpe import simple_speaker_listener_v4
+    before = time.time()
 
     SEQ_LENGTH = 25
     env = simple_speaker_listener_v4.parallel_env(max_cycles=SEQ_LENGTH)
     aec_env = simple_speaker_listener_v4.env(max_cycles=SEQ_LENGTH)
 
-    agent_idxs = {agent: idx for idx, agent in enumerate(env.possible_agents)}
-    agent_ids_list = list(agent_idxs.keys())
-    agent_obs_dims = {agent: env.observation_space(agent).shape[0] for agent in env.possible_agents}
-    agent_action_dims = {agent: env.action_space(agent).n for agent in env.possible_agents}
-    rnn = MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True)
-    agent_state_idxs = {}
+    learner = QMIXLearner(
+        MultiAgentDQN_fn = lambda obs, act: MultiAgentDRQN(obs, act, last_action_input=True),
+        Qmixer_fn = lambda ids, state_shape: QMixer(ids, state_shape),
+        optimizer_lr = 0.005,
+        epsilon_schedule = ExpDecaySchedule(decay_steps=100000, min_epsilon=0.1),
+        replay_buffer = ReplayBuffer(storage=LazyTensorStorage(max_size=500, device=torch.device("cuda"))),
+        max_gradient_norm = None
+    )
+
+    episode_returns, final_model, best_model, saved_models = learner.train(env, gamma=0.95, num_episodes=2000, max_episode_length=SEQ_LENGTH,
+                                                                           batch_size=128, tau=0.05)
     
-    idx = 0
-    for agent in env.possible_agents:
-        obs_length = env.observation_space(agent).shape[0]
-        agent_state_idxs[agent] = slice(idx, idx+obs_length)
-        idx += obs_length
+    results = {'episode_returns': episode_returns, 'final_model': final_model, 'best_model': best_model, 'saved_models': saved_models}
+    import pickle
+    with open('testfiles/qmix_speakerlistener.results', 'wb') as file:
+       pickle.dump(results, file)
 
-    #NOTE: assume env observation space is flattened (1 dimension) array
-    #NOTE: assume discrete action space
-
-    #dims = (seq length, num agents, L)
-    state_history = torch.zeros(SEQ_LENGTH, sum(agent_obs_dims.values()))
-    obs_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, rnn.obs_dim, dtype=torch.float32) #L = max(obs space length) 
-    act_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, 1, dtype=torch.long) #L = 1
-    reward_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, 1, dtype=torch.float32) #L = 1
-    next_state_history = torch.zeros(SEQ_LENGTH, sum(agent_obs_dims.values()))
-    next_obs_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, rnn.obs_dim, dtype=torch.float32) # L = max(obs space length) 
-    is_term_history = torch.zeros(SEQ_LENGTH, rnn.n_agents, 1, dtype=torch.bool) #L = 1
-
-    pad_mask = torch.ones(SEQ_LENGTH, rnn.n_agents, 1, dtype=torch.bool) #L = 1, pad=1 by default, set to 0 within episode loop
-    agent_id = torch.zeros_like(act_history) #L = 1
-    for idx in agent_idxs.values():
-        agent_id[:, idx, 0] = idx
-
-    state = env.reset()[0]
-    for t in count():
-        if not env.agents or t==20: break
-        actions = {} #agent: action dict to pass to env.step function
-        for agent in env.agents:
-            #store agent obs at time t
-            obs = torch.tensor(state[agent])
-            state_history[t, agent_state_idxs[agent]] = obs #shared state history
-            idx = agent_idxs[agent]
-            obs_history[t, idx] = right_pad(rnn.obs_dim, obs) #individual obs history
-            
-            action = rnn.select_action(obs_history[:t+1, idx], agent, act_history[:t+1, idx])
-            act_history[t, idx] = action #store agent action at time t
-            actions[agent] = action.item()
-
-        state, reward, terminated, truncated, _ = env.step(actions)
-
-        for agent in env.agents:
-            #store agent next obs at time t
-            obs = torch.tensor(state[agent])
-            next_state_history[t, agent_state_idxs[agent]] = obs
-            idx = rnn.agent_id_to_idx[agent]
-            next_obs_history[t, idx] = right_pad(rnn.obs_dim, obs) #individual obs history
-
-            reward_history[t, idx, 0] = reward[agent]
-            is_term_history[t, idx, 0] = terminated[agent]
-            pad_mask[t, idx, 0] = False
-
-        #store stuff
-    episode = Episode(state_history, obs_history, act_history, reward_history, next_state_history, next_obs_history, is_term_history, agent_id, pad_mask)
-    print('parallel env done')
-    res = rnn(episode.obs, agent_ids_list, episode.actions)
-    
-    x = QMixer(agent_ids_list, sum(agent_obs_dims.values()), (4, 8, 12), (4, 8))
-    y = QMixer(agent_ids_list, sum(agent_obs_dims.values()))
-    z = QMixer(agent_ids_list, sum(agent_obs_dims.values()), hypernet_hidden_dims=None)
-    x(res[1][..., 1:4], episode.states, agent_ids_list[1:4])
-    y(torch.cat((res[1].unsqueeze(0),res[1].unsqueeze(0))), torch.cat((episode.states.unsqueeze(0),episode.states.unsqueeze(0))), agent_ids_list)
-    z(res[1], episode.states, agent_ids_list)
-    x(res[1][0], episode.states[0], agent_ids_list)
-
-    optimizer = optim.RMSprop(x.parameters(), 1e-4)
-    for _ in range(20):
-        res = rnn(episode.obs, agent_ids_list, episode.actions)
-        g = x(torch.cat((res[1].unsqueeze(0),res[1].unsqueeze(0))), torch.cat((episode.states.unsqueeze(0),episode.states.unsqueeze(0))), agent_ids_list)
-        loss = nn.MSELoss()(g, torch.zeros(g.shape, device=g.device))
-        print(loss)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    #TODO: parameter (epsilon/alpha, etc.) schedule instead of 'exploration_strategy'
-
-
-    print('test')
-
-    learner = QMIXLearner(lambda agent_obs_dims, agent_action_dims: MultiAgentDRQN(agent_obs_dims, agent_action_dims, last_action_input=True))
-    learner._init_model(env)
-    #learner.train(env, num_episodes=50, max_episode_length=20, evaluate=True)
-    x = learner.train(env, num_episodes=50, max_episode_length=SEQ_LENGTH, evaluate=False)
     print('done')
+    print(time.time() - before)
+
+    import matplotlib.pyplot as plt
+    episode_returns = results['episode_returns'][episode_returns.keys()[0]]
+    plt.plot(range(len(episode_returns)), episode_returns)
+    plt.title('Total return')
+    plt.show()
