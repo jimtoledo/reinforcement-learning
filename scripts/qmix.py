@@ -487,7 +487,7 @@ class QMIXLearner():
             #select best action of next state according to online model (double q learning)
             next_actions = self.online_model(batch.next_obs, self.agents, batch.actions[:, 1:])[2].unsqueeze(-1) #shift action history left for next_actions input
             #get values of next states using target network/mixer
-            next_agent_qs = self.target_model(batch.next_obs, self.agents, batch.actions[:, 1:])[0].gather(dim=-1, index=next_actions).squeeze()
+            next_agent_qs = self.target_model(batch.next_obs, self.agents, batch.actions[:, 1:])[0].gather(dim=-1, index=next_actions).squeeze(-1)
             next_qs = self.target_mixer(next_agent_qs, batch.next_states, self.agents).detach()
         target_qs = rewards + (self.gamma * next_qs * (1 - is_terminals))
 
@@ -715,35 +715,51 @@ class QMIXLearner():
 
 if __name__ == '__main__':
     import time
+    from pettingzoo.mpe import simple_v3
     from pettingzoo.mpe import simple_speaker_listener_v4
+    from pettingzoo.mpe import simple_spread_v3
+    from pettingzoo.mpe import simple_reference_v3
     before = time.time()
 
     SEQ_LENGTH = 25
+    #env = simple_v3.parallel_env(max_cycles=SEQ_LENGTH)
     env = simple_speaker_listener_v4.parallel_env(max_cycles=SEQ_LENGTH)
-    aec_env = simple_speaker_listener_v4.env(max_cycles=SEQ_LENGTH)
+    #env = simple_spread_v3.parallel_env(max_cycles=SEQ_LENGTH)
+    #env = simple_reference_v3.parallel_env(max_cycles=SEQ_LENGTH)
 
     learner = QMIXLearner(
-        MultiAgentDQN_fn = lambda obs, act: MultiAgentDRQN(obs, act, last_action_input=True),
-        Qmixer_fn = lambda ids, state_shape: QMixer(ids, state_shape),
-        optimizer_lr = 0.005,
-        epsilon_schedule = ExpDecaySchedule(decay_steps=100000, min_epsilon=0.1),
+        #MultiAgentDQN_fn = lambda obs, act: MultiAgentDRQN(obs, act, fc1_hidden_dims=(128,), rnn_dims=(64,64), last_action_input=False),
+        MultiAgentDQN_fn = lambda obs, act: MultiAgentDRQN(obs, act, fc1_hidden_dims=(128,), rnn_dims=(64,64), last_action_input=True),
+        Qmixer_fn = lambda ids, state_shape: QMixer(ids, state_shape, hypernet_hidden_dims=(64, 64)),
+        optimizer_lr = 0.0005,
+        epsilon_schedule = ExpDecaySchedule(decay_steps=50000, min_epsilon=0.1),
         replay_buffer = ReplayBuffer(storage=LazyTensorStorage(max_size=500, device=torch.device("cuda"))),
         max_gradient_norm = None
     )
-
-    episode_returns, final_model, best_model, saved_models = learner.train(env, gamma=0.95, num_episodes=2000, max_episode_length=SEQ_LENGTH,
-                                                                           batch_size=128, tau=0.05)
+    #~2.3-2.5 it/s
+    #seeds = [np.random.randint(1000) for _ in range(20)]
+    seeds = []
+    episode_returns, final_model, best_model, saved_models = learner.train(env, gamma=0.99, num_episodes=10000, max_episode_length=SEQ_LENGTH,
+                                                                           batch_size=128, tau=0.005, seeds=seeds)
     
-    results = {'episode_returns': episode_returns, 'final_model': final_model, 'best_model': best_model, 'saved_models': saved_models}
+    results = {'episode_returns': episode_returns, 'final_model': final_model, 'best_model': best_model, 'saved_models': saved_models, 'seeds': seeds}
     import pickle
-    with open('testfiles/qmix_speakerlistener.results', 'wb') as file:
+    #with open('testfiles/qmix_simple.results', 'wb') as file:
+    #with open('testfiles/qmix_speakerlistener_lastaction.results', 'wb') as file:
+    with open('testfiles/qmix_speakerlistener_lastaction_seeded.results', 'wb') as file:
+    #with open('testfiles/qmix_spread_lastaction.results', 'wb') as file:
+    #with open('testfiles/qmix_reference_lastaction.results', 'wb') as file:
        pickle.dump(results, file)
 
     print('done')
     print(time.time() - before)
 
     import matplotlib.pyplot as plt
-    episode_returns = results['episode_returns'][episode_returns.keys()[0]]
+    episode_returns = results['episode_returns'][list(episode_returns.keys())[0]]
     plt.plot(range(len(episode_returns)), episode_returns)
     plt.title('Total return')
+    plt.show()
+    plt.plot(range(len(episode_returns)), [np.mean(episode_returns[max(0,x-100):x+1]) for x in range(len(episode_returns))])
+    plt.title('Moving average of total return (k=100)')
+    plt.xlim(left=100)
     plt.show()
